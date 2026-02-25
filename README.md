@@ -1,7 +1,7 @@
 # Emerald Password Share
 
 Secure, self-destructing encrypted note and file sharing for The Emerald Group.
-Inspired by 
+Inspired by [cryptgeon](https://github.com/cupcakearmy/cryptgeon) by [@cupcakearmy](https://github.com/cupcakearmy).
 
 ## Stack
 
@@ -35,20 +35,24 @@ docker compose up --build -d
 
 App runs at **http://localhost:8001**
 
-Needs an SSL to generate note
+> **Note:** An SSL/TLS certificate is required to generate notes (WebCrypto requires a secure context).
 
 ## Environment variables
 
-| Variable           | Default                  | Description                     |
-|--------------------|--------------------------|----------------------------------|
-| `REDIS`            | `redis://redis/`         | Redis connection URL              |
-| `SIZE_LIMIT_BYTES` | `83886080` (80 MiB)      | Max note payload size             |
-| `MAX_VIEWS`        | `100`                    | Max allowed views per note        |
-| `MAX_EXPIRATION`   | `360`                    | Max expiration in minutes         |
-| `ALLOW_ADVANCED`   | `true`                   | Allow advanced options            |
-| `ALLOW_FILES`      | `true`                   | Allow file uploads                |
-| `VERBOSITY`        | `INFO`                   | Log level                         |
-| `THEME_IMAGE`      | Emerald logo URL         | Logo image URL                    |
-| `THEME_PAGE_TITLE` | `Emerald Password Share` | Browser tab title                 |
-| `THEME_FAVICON`    | Emerald favicon URL      | Favicon URL                       |
-| `THEME_TEXT`       | *(empty)*                | Custom intro text (HTML)          |
+| Variable           | Default                  | Description                       |
+|--------------------|--------------------------|-----------------------------------|
+| `REDIS`            | `redis://redis/`         | Redis connection URL               |
+| `SIZE_LIMIT_BYTES` | `83886080` (80 MiB)      | Max note payload size              |
+| `MAX_VIEWS`        | `100`                    | Max allowed views per note         |
+| `MAX_EXPIRATION`   | `360`                    | Max expiration in minutes          |
+| `ALLOW_ADVANCED`   | `true`                   | Allow advanced options             |
+| `ALLOW_FILES`      | `true`                   | Allow file uploads                 |
+| `VERBOSITY`        | `INFO`                   | Log level                          |
+| `RATE_LIMIT_CREATE`| `20`                     | Max note creations per minute/IP   |
+| `RATE_LIMIT_READ`  | `60`                     | Max note reads per minute/IP       |
+| `THEME_IMAGE`      | Emerald logo URL         | Logo image URL                     |
+| `THEME_PAGE_TITLE` | `Emerald Password Share` | Browser tab title                  |
+| `THEME_FAVICON`    | Emerald favicon URL      | Favicon URL                        |
+| `THEME_TEXT`       | *(empty)*                | Custom intro text (HTML)           |
+| `IMPRINT_URL`      | *(empty)*                | Imprint/legal page URL             |
+| `IMPRINT_HTML`     | *(empty)*                | Imprint/legal HTML content         |
