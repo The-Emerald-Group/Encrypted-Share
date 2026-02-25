@@ -18,6 +18,9 @@ services:
       ALLOW_ADVANCED: "true"
       ALLOW_FILES: "true"
       VERBOSITY: "INFO"
+      # Rate limiting (requests per minute per IP)
+      RATE_LIMIT_CREATE: "20"
+      RATE_LIMIT_READ: "60"
     ports:
       - "8001:8000"
     restart: unless-stopped
