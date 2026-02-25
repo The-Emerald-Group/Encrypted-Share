@@ -15,6 +15,7 @@ COPY --from=builder /install /usr/local
 
 # Copy application
 COPY app/main.py .
+COPY app/VERSION .
 COPY frontend ./frontend
 
 ENV FRONTEND_PATH="./frontend"
@@ -23,6 +24,7 @@ ENV VERBOSITY="INFO"
 
 EXPOSE 8000
 
+# Uses /api/live which performs a real Redis round-trip, not just a ping
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD wget -qO- http://localhost:8000/api/live || exit 1
 
