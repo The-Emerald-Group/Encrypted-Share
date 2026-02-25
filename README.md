@@ -24,7 +24,7 @@ Inspired by [cryptgeon](https://github.com/cupcakearmy/cryptgeon) by [@cupcakear
 
 ```bash
 # Build
-docker build -t emerald-cryptgeon:latest .
+docker build -t encrypt-share:latest .
 
 # Run (uses docker-compose.yaml)
 docker compose up -d
