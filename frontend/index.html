@@ -92,6 +92,16 @@ footer{
   border-radius:var(--radius);
 }
 .warning strong{color:#ff8888}
+.info-box{
+  background:var(--c2);
+  border:1px solid var(--c4);
+  border-left:3px solid var(--green);
+  padding:0.6rem 0.8rem;
+  font-size:0.78rem;
+  color:var(--t1);
+  margin-bottom:1.2rem;
+  border-radius:var(--radius);
+}
 
 /* ── Inputs ───────────────────────────────────────────────────────── */
 input,textarea{
@@ -352,13 +362,16 @@ button{font-family:var(--mono);border-radius:var(--radius);cursor:pointer;transi
    UTILITIES
 ═══════════════════════════════════════════════════════════════════ */
 const $ = id => document.getElementById(id)
-const html = (s,p={}) => s.replace(/\{\{(\w+)\}\}/g, (_,k) => esc(p[k]??''))
 
+// Safe escape for HTML attribute/text contexts
 function esc(s){
   return String(s)
     .replace(/&/g,'&amp;').replace(/</g,'&lt;')
     .replace(/>/g,'&gt;').replace(/"/g,'&quot;')
 }
+
+// Safe text node setter — never uses innerHTML with untrusted content
+function setText(el, text){ if(el) el.textContent = text }
 
 function render(content){
   const app = $('app')
@@ -380,7 +393,7 @@ function toast(msg, type='ok'){
   const wrap = $('toasts')
   const el = document.createElement('div')
   el.className = `toast ${type}`
-  el.textContent = msg
+  el.textContent = msg          // textContent — no XSS risk
   wrap.appendChild(el)
   setTimeout(()=>{ el.style.transition='opacity 0.3s'; el.style.opacity='0'; setTimeout(()=>el.remove(),320) }, 3200)
 }
@@ -428,6 +441,33 @@ async function decryptToText(hexStr, key){
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+   CLIPBOARD  (with fallback for non-HTTPS / permission-denied)
+═══════════════════════════════════════════════════════════════════ */
+async function copyToClipboard(text){
+  // Modern async API
+  if(navigator.clipboard && window.isSecureContext){
+    try{
+      await navigator.clipboard.writeText(text)
+      toast('Copied to clipboard','ok')
+      return
+    } catch(_){}
+  }
+  // Fallback: create a temporary textarea and use execCommand
+  try{
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.cssText = 'position:fixed;opacity:0;pointer-events:none'
+    document.body.appendChild(ta)
+    ta.focus(); ta.select()
+    document.execCommand('copy')
+    document.body.removeChild(ta)
+    toast('Copied to clipboard','ok')
+  } catch(_){
+    toast('Could not copy — please copy manually','err')
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
    API
 ═══════════════════════════════════════════════════════════════════ */
 async function apiGet(path){
@@ -447,6 +487,22 @@ async function apiDelete(path){
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+   PRIVATE STATE  (not on window — closure-scoped to avoid leaking
+   decrypted content to the global scope / browser console)
+═══════════════════════════════════════════════════════════════════ */
+const _private = (() => {
+  let _plaintext = null
+  let _decFiles  = null
+  return {
+    setPlaintext(v){ _plaintext = v },
+    getPlaintext(){ return _plaintext },
+    setDecFiles(v){ _decFiles = v },
+    getDecFiles(){ return _decFiles },
+    clear(){ _plaintext = null; _decFiles = null },
+  }
+})()
+
+/* ═══════════════════════════════════════════════════════════════════
    ROUTER
 ═══════════════════════════════════════════════════════════════════ */
 let _status = null
@@ -461,22 +517,38 @@ async function boot(){
 
 function applyTheme(s){
   if(!s) return
-  if(s.theme_page_title) document.title = s.theme_page_title
+  if(s.theme_page_title) document.title = esc(s.theme_page_title)
   if(s.theme_favicon){
     let l = document.querySelector("link[rel~='icon']")||document.createElement('link')
-    l.rel='icon'; l.href=s.theme_favicon; document.head.appendChild(l)
+    l.rel='icon'; l.href=esc(s.theme_favicon); document.head.appendChild(l)
   }
   if(s.theme_image){
-    $('logoArea').innerHTML=`<a href="/"><img class="logo-img" src="${esc(s.theme_image)}" alt="Logo"/></a>`
+    // Build DOM node instead of innerHTML to avoid XSS via theme_image URL
+    const a   = document.createElement('a'); a.href = '/'
+    const img = document.createElement('img')
+    img.className = 'logo-img'
+    img.src = s.theme_image   // browser sanitises this natively
+    img.alt = 'Logo'
+    a.appendChild(img)
+    $('logoArea').innerHTML = ''
+    $('logoArea').appendChild(a)
   }
-  $('footerVer').textContent = `Emerald Password Share v${s.version||''}`
+  // theme_text is operator-controlled HTML — render it, but note in docs
+  // that operators must treat it as trusted input.
+  if(s.theme_text){
+    // Intentionally rendered as HTML — operator-controlled only, not user data
+    const introEl = document.getElementById('themeIntro')
+    if(introEl) introEl.innerHTML = s.theme_text
+  }
+  const ver = $('footerVer')
+  if(ver) ver.textContent = `Emerald Password Share v${s.version||''}`
 }
 
 /* ═══════════════════════════════════════════════════════════════════
    HOME PAGE
 ═══════════════════════════════════════════════════════════════════ */
 const _home = {
-  mode: 'text',   // 'text' | 'file'
+  mode: 'text',
   advanced: false,
   timeMode: false,
   files: [],
@@ -488,11 +560,10 @@ async function pageHome(){
   const maxMB = s ? fmtBytes(s.max_size) : '80 MB'
   const allowAdv  = s ? s.allow_advanced : true
   const allowFile = s ? s.allow_files    : true
-  const introText = s?.theme_text
-    || 'Easily send <span style="color:var(--green)">fully encrypted</span> notes and files. The link is the key — share it once.'
+  const defaultIntro = 'Easily send <span style="color:var(--green)">fully encrypted</span> notes and files. The link is the key — share it once.'
 
   render(`<div class="page">
-    <p style="font-size:0.82rem;color:var(--t1);margin-bottom:1.5rem;line-height:1.6">${introText}</p>
+    <p id="themeIntro" style="font-size:0.82rem;color:var(--t1);margin-bottom:1.5rem;line-height:1.6">${defaultIntro}</p>
 
     ${allowFile ? `
     <div class="mode-toggle">
@@ -539,7 +610,19 @@ async function pageHome(){
       </div>
       <p class="hint">Custom passwords are never included in the share link. The recipient will need it separately.</p>
     </div>` : ''}
+
+    <p class="hint" style="margin-top:1.2rem">
+      🔒 Notes are encrypted in your browser before being sent. The server never sees the contents.
+      The share link contains the decryption key in the <code style="color:var(--green)">#fragment</code>,
+      which is never sent to the server. Avoid forwarding the full link over insecure channels.
+    </p>
   </div>`)
+
+  // Apply theme_text after render so the element exists
+  if(_status?.theme_text){
+    const el = document.getElementById('themeIntro')
+    if(el) el.innerHTML = _status.theme_text
+  }
 
   renderInputArea()
 }
@@ -635,8 +718,19 @@ function updateStatus(){
 
 function setBusy(msg){
   _home.busy = true
-  const btn = $('submitBtn'); if(btn){ btn.disabled=true; btn.innerHTML=`${msg}<span class="spinner"></span>` }
-  const sm = $('statusMsg'); if(sm) sm.innerHTML=`<span style="color:var(--t2)">${msg}<span class="spinner"></span></span>`
+  const btn = $('submitBtn')
+  if(btn){
+    btn.disabled = true
+    btn.textContent = msg
+    const sp = document.createElement('span'); sp.className='spinner'
+    btn.appendChild(sp)
+  }
+  const sm = $('statusMsg')
+  if(sm){
+    sm.textContent = msg
+    const sp = document.createElement('span'); sp.className='spinner'
+    sm.appendChild(sp)
+  }
 }
 
 async function handleCreate(){
@@ -656,12 +750,12 @@ async function handleCreate(){
 
     let contents, type
     if(_home.mode === 'file'){
-      if(_home.files.length === 0){ toast('No files selected','err'); return }
+      if(_home.files.length === 0){ toast('No files selected','err'); _home.busy=false; await pageHome(); return }
       contents = await encryptFiles(_home.files, key)
       type = 'file'
     } else {
       const txt = $('noteText')?.value || ''
-      if(!txt.trim()){ toast('Note is empty','err'); return }
+      if(!txt.trim()){ toast('Note is empty','err'); _home.busy=false; await pageHome(); return }
       contents = await encryptText(txt, key)
       type = 'text'
     }
@@ -683,16 +777,16 @@ async function handleCreate(){
     pageResult(url, pw)
   } catch(err){
     if(err.status===413) toast('Note is too large','err')
+    else if(err.status===429) toast('Too many requests — please wait a moment','err')
     else toast('Failed to create note. Please try again.','err')
     console.error(err)
     _home.busy = false
-    // Re-render to restore button
     await pageHome()
   }
 }
 
 function pageResult(url, hasCustomPw){
-  const mailto = `mailto:support@emerald-group.co.uk?subject=${encodeURIComponent('Shared secure note')}&body=${encodeURIComponent(url)}`
+  const mailto = `mailto:?subject=${encodeURIComponent('Shared secure note')}&body=${encodeURIComponent(url)}`
   render(`<div class="page">
     <div class="result-card">
       <h2>Note created</h2>
@@ -700,10 +794,13 @@ function pageResult(url, hasCustomPw){
         <span class="label">Share link</span>
         <div class="input-row">
           <input type="text" id="shareUrl" readonly value="${esc(url)}"/>
-          <button class="btn-icon" onclick="copyUrl()">Copy</button>
+          <button class="btn-icon" onclick="copyShareUrl()">Copy</button>
         </div>
       </div>
       ${hasCustomPw ? `<p class="hint" style="margin-top:0.5rem">⚠ Password is required to open this note — share it separately.</p>` : ''}
+      <div class="info-box" style="margin-top:0.8rem">
+        ⚠ The link contains the decryption key. Anyone with the link can read the note — treat it like a password.
+      </div>
       <div class="result-actions">
         <a href="${esc(mailto)}" style="text-decoration:none">
           <button class="btn-outline">✉ Send via email</button>
@@ -714,13 +811,14 @@ function pageResult(url, hasCustomPw){
   </div>`)
 }
 
-function copyUrl(){
-  const url = $('shareUrl')?.value||''
-  navigator.clipboard.writeText(url).then(()=>toast('Copied to clipboard','ok'))
+function copyShareUrl(){
+  const url = $('shareUrl')?.value || ''
+  copyToClipboard(url)
 }
 
 function startOver(){
   _home.mode='text'; _home.advanced=false; _home.timeMode=false; _home.files=[]; _home.busy=false
+  _private.clear()
   pageHome()
 }
 
@@ -737,8 +835,11 @@ async function pageNote(id){
     const info = await apiGet(`/api/notes/${id}`)
     meta = JSON.parse(info.meta || '{}')
   } catch(e){
+    const msg = e.status === 429
+      ? 'Too many requests — please wait a moment and try again.'
+      : 'This note was not found, has already been viewed, or has expired.'
     render(`<div class="page">
-      <p style="color:var(--red);margin-bottom:1rem">This note was not found, has already been viewed, or has expired.</p>
+      <p style="color:var(--red);margin-bottom:1rem">${esc(msg)}</p>
       <a href="/"><button class="btn-ghost">← Create a new note</button></a>
     </div>`)
     return
@@ -756,45 +857,56 @@ async function pageNote(id){
   }
 }
 
+// Store note meta in a module-scoped variable, not on window
+let _pendingNoteMeta = null
+
 function renderRevealButton(id, meta, hashKey){
+  _pendingNoteMeta = meta
+  const isFile = meta.type === 'file'
   render(`<div class="page">
     <p style="font-size:0.82rem;color:var(--t1);margin-bottom:1.5rem">
       This note will be permanently deleted once you reveal it.<br/>
       <strong style="color:var(--t0)">You will not be able to see it again.</strong>
     </p>
+    ${isFile ? `<div class="info-box">
+      ⬇ This note contains <strong>files</strong>. Make sure you are ready to download them before proceeding —
+      they cannot be retrieved after this page is closed.
+    </div>` : ''}
     <button class="btn-primary" id="revealBtn" onclick="revealNote('${esc(id)}',null,'${esc(hashKey)}')">Reveal note</button>
     <p id="revealErr" class="error" style="display:none"></p>
   </div>`)
-  window._noteMeta = meta
 }
 
 function renderPasswordPrompt(id, meta){
+  _pendingNoteMeta = meta
   render(`<div class="page pw-card">
     <p>This note is protected with a custom password.<br/>Enter it below to decrypt and reveal the note.</p>
     <div class="field">
       <span class="label">Password</span>
-      <input type="password" id="pwInput" placeholder="Enter password…"/>
+      <input type="password" id="pwInput" placeholder="Enter password…"
+        onkeydown="if(event.key==='Enter') revealNote('${esc(id)}','pw',null)"/>
     </div>
     <button class="btn-primary" id="revealBtn" onclick="revealNote('${esc(id)}','pw',null)">Reveal note</button>
     <p id="revealErr" class="error" style="display:none"></p>
   </div>`)
-  window._noteMeta = meta
 }
 
 async function revealNote(id, pwMode, hashKey){
   const btn = $('revealBtn'); if(!btn) return
   const errEl = $('revealErr')
-  btn.disabled=true; btn.innerHTML=`Decrypting<span class="spinner"></span>`
+  btn.disabled=true
+  btn.textContent='Decrypting'
+  const sp = document.createElement('span'); sp.className='spinner'; btn.appendChild(sp)
   if(errEl) errEl.style.display='none'
 
   try{
     const data = await apiDelete(`/api/notes/${id}`)
-    const meta = window._noteMeta || {}
+    const meta = _pendingNoteMeta || {}
     let key
 
     if(pwMode === 'pw'){
       const pw = $('pwInput')?.value
-      if(!pw){ throw Object.assign(new Error('No password'))}
+      if(!pw){ throw Object.assign(new Error('No password')) }
       const d = await deriveKey(pw, meta.derivation)
       key = d.key
     } else {
@@ -809,9 +921,10 @@ async function revealNote(id, pwMode, hashKey){
       renderDecryptedText(plaintext)
     }
   } catch(e){
-    const msg = e.status===404
-      ? 'Note not found — it may have already been viewed.'
-      : 'Decryption failed. Wrong password or broken link.'
+    let msg
+    if(e.status === 404)      msg = 'Note not found — it may have already been viewed.'
+    else if(e.status === 429) msg = 'Too many requests — please wait a moment.'
+    else                      msg = 'Decryption failed. Wrong password or broken link.'
     if(errEl){ errEl.textContent=msg; errEl.style.display='block' }
     if(btn){ btn.disabled=false; btn.textContent='Try again' }
   }
@@ -820,30 +933,71 @@ async function revealNote(id, pwMode, hashKey){
 function renderDecryptedText(text){
   const urlRe = /[A-Za-z][A-Za-z0-9+\-.]*:\/\/[^\s<>"']+/g
   const links  = [...new Set(text.match(urlRe)||[])]
-  window._plaintext = text
 
-  render(`<div class="page">
-    <div class="warning">⚠ <strong>This is your one chance</strong> to read this note. It has been permanently deleted.</div>
-    <div class="note-box">${esc(text)}</div>
-    <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:1rem">
-      <button class="btn-outline" onclick="copyPlaintext()">Copy to clipboard</button>
-      <a href="/"><button class="btn-ghost">← New note</button></a>
-    </div>
-    ${links.length ? `<div class="links-box">
-      <p>Links found in this note:</p>
-      ${links.map(l=>`<a href="${esc(l)}" target="_blank" rel="noopener noreferrer">${esc(l)}</a>`).join('')}
-    </div>` : ''}
-  </div>`)
+  // Store in private closure, not on window
+  _private.setPlaintext(text)
+
+  // Build the note box safely using a text node
+  const noteBox = document.createElement('div')
+  noteBox.className = 'note-box'
+  noteBox.textContent = text   // safe — no innerHTML
+
+  const container = document.createElement('div')
+  container.className = 'page'
+
+  // Warning banner
+  const warn = document.createElement('div')
+  warn.className = 'warning'
+  warn.innerHTML = '⚠ <strong>This is your one chance</strong> to read this note. It has been permanently deleted.'
+  container.appendChild(warn)
+  container.appendChild(noteBox)
+
+  // Action buttons row
+  const btnRow = document.createElement('div')
+  btnRow.style.cssText = 'display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:1rem'
+  const copyBtn = document.createElement('button')
+  copyBtn.className = 'btn-outline'
+  copyBtn.textContent = 'Copy to clipboard'
+  copyBtn.onclick = copyPlaintext
+  const newBtn = document.createElement('a')
+  newBtn.href = '/'
+  newBtn.innerHTML = '<button class="btn-ghost">← New note</button>'
+  btnRow.appendChild(copyBtn)
+  btnRow.appendChild(newBtn)
+  container.appendChild(btnRow)
+
+  // Links found
+  if(links.length){
+    const linksBox = document.createElement('div')
+    linksBox.className = 'links-box'
+    const p = document.createElement('p')
+    p.textContent = 'Links found in this note:'
+    linksBox.appendChild(p)
+    links.forEach(l=>{
+      const a = document.createElement('a')
+      a.href = l
+      a.target = '_blank'
+      a.rel = 'noopener noreferrer'
+      a.textContent = l   // textContent — safe
+      linksBox.appendChild(a)
+    })
+    container.appendChild(linksBox)
+  }
+
+  render(container)
 }
 
 function copyPlaintext(){
-  navigator.clipboard.writeText(window._plaintext||'').then(()=>toast('Copied','ok'))
+  copyToClipboard(_private.getPlaintext() || '')
 }
 
 function renderDecryptedFiles(files){
-  window._decFiles = files
+  // Store in private closure, not on window
+  _private.setDecFiles(files)
+
   render(`<div class="page">
     <div class="warning">⚠ <strong>This is your one chance</strong> to download these files. They have been permanently deleted.</div>
+    <div class="info-box">Save all files before navigating away — they cannot be recovered.</div>
     ${files.map((f,i)=>`
       <div class="file-dl-row">
         <div>
@@ -860,13 +1014,18 @@ function renderDecryptedFiles(files){
 }
 
 function dlFile(i){
-  const f = window._decFiles[i]
+  const files = _private.getDecFiles()
+  if(!files) return
+  const f = files[i]
   const blob = new Blob([new Uint8Array(f.contents)],{type:f.type||'application/octet-stream'})
   const a = Object.assign(document.createElement('a'),{href:URL.createObjectURL(blob),download:f.name})
   a.click(); URL.revokeObjectURL(a.href)
 }
 
-function dlAll(){ (window._decFiles||[]).forEach((_,i)=>dlFile(i)) }
+function dlAll(){
+  const files = _private.getDecFiles()
+  if(files) files.forEach((_,i)=>dlFile(i))
+}
 
 /* ═══════════════════════════════════════════════════════════════════
    BOOT
