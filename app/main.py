@@ -1,3 +1,4 @@
+import json
 import os
 import secrets
 import time
@@ -10,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -24,18 +25,31 @@ log = logging.getLogger("emerald")
 REDIS_URL        = os.getenv("REDIS", "redis://redis/")
 FRONTEND_PATH    = os.getenv("FRONTEND_PATH", "./frontend")
 SIZE_LIMIT_BYTES = int(os.getenv("SIZE_LIMIT_BYTES", str(80 * 1024 * 1024)))  # 80 MiB
+META_LIMIT_BYTES = int(os.getenv("META_LIMIT_BYTES", str(4 * 1024)))           # 4 KiB
 MAX_VIEWS        = int(os.getenv("MAX_VIEWS", "100"))
 MAX_EXPIRATION   = int(os.getenv("MAX_EXPIRATION", "360"))  # minutes
 ALLOW_ADVANCED   = os.getenv("ALLOW_ADVANCED", "true").lower() == "true"
 ALLOW_FILES      = os.getenv("ALLOW_FILES", "true").lower() == "true"
 ID_LENGTH        = int(os.getenv("ID_LENGTH", "32"))
+RATE_LIMIT_CREATE = int(os.getenv("RATE_LIMIT_CREATE", "20"))   # per minute per IP
+RATE_LIMIT_READ   = int(os.getenv("RATE_LIMIT_READ",   "60"))   # per minute per IP
 THEME_IMAGE      = os.getenv("THEME_IMAGE", "https://emerald-group.co.uk/wp-content/uploads/2022/10/Emeralds-Group-Logo-Lighter-text.svg")
 THEME_TEXT       = os.getenv("THEME_TEXT", "")
 THEME_PAGE_TITLE = os.getenv("THEME_PAGE_TITLE", "Emerald Password Share")
 THEME_FAVICON    = os.getenv("THEME_FAVICON", "https://www.emerald-group.co.uk/wp-content/uploads/2022/08/cropped-emerald-favicon-32x32.png")
 IMPRINT_URL      = os.getenv("IMPRINT_URL", "")
 IMPRINT_HTML     = os.getenv("IMPRINT_HTML", "")
-VERSION          = "3.0.0"
+
+# Version: read from VERSION file baked in at build time, fall back to env, then default
+def _read_version() -> str:
+    try:
+        with open(os.path.join(os.path.dirname(__file__), "VERSION")) as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        pass
+    return os.getenv("APP_VERSION", "3.0.0")
+
+VERSION = _read_version()
 
 # ── Redis ─────────────────────────────────────────────────────────────────────
 redis_client: aioredis.Redis = None
@@ -64,6 +78,13 @@ class NoteCreate(BaseModel):
     views: Optional[int] = None
     expiration: Optional[int] = None  # minutes
 
+    @field_validator("meta")
+    @classmethod
+    def meta_size(cls, v: str) -> str:
+        if len(v.encode()) > META_LIMIT_BYTES:
+            raise ValueError(f"meta exceeds {META_LIMIT_BYTES} bytes")
+        return v
+
 class NotePublic(BaseModel):
     contents: str
     meta: str
@@ -76,7 +97,10 @@ class CreateResponse(BaseModel):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def generate_id() -> str:
-    return secrets.token_urlsafe(ID_LENGTH)[:ID_LENGTH]
+    # token_urlsafe(n) produces ceil(n*4/3) URL-safe chars; request enough bytes
+    # so we always have at least ID_LENGTH characters, then trim.
+    raw = secrets.token_urlsafe(ID_LENGTH)
+    return raw[:ID_LENGTH]
 
 def get_client_ip(request: Request) -> str:
     cf_ip = request.headers.get("CF-Connecting-IP")
@@ -85,6 +109,23 @@ def get_client_ip(request: Request) -> str:
     if request.client:
         return request.client.host
     return "unknown"
+
+async def check_rate_limit(ip: str, action: str, limit: int) -> bool:
+    """
+    Sliding-window rate limiter using a Redis sorted set.
+    Returns True if the request is allowed, False if the limit is exceeded.
+    """
+    now = time.time()
+    window = 60  # 1 minute
+    key = f"rl:{action}:{ip}"
+    pipe = redis_client.pipeline()
+    pipe.zremrangebyscore(key, 0, now - window)
+    pipe.zadd(key, {str(now): now})
+    pipe.zcard(key)
+    pipe.expire(key, window + 1)
+    results = await pipe.execute()
+    count = results[2]
+    return count <= limit
 
 # ── API routes ────────────────────────────────────────────────────────────────
 
@@ -107,19 +148,33 @@ async def get_status():
 
 @app.get("/api/live")
 async def health():
+    """
+    End-to-end health check: verifies Redis connectivity AND
+    that the app can perform a real read/write round-trip.
+    """
     try:
-        await redis_client.ping()
+        probe_key = "healthcheck:probe"
+        await redis_client.set(probe_key, "1", ex=5)
+        val = await redis_client.get(probe_key)
+        if val != "1":
+            raise RuntimeError("Redis round-trip mismatch")
         return {"ok": True}
-    except Exception:
+    except Exception as e:
+        log.warning("Health check failed: %s", e)
         raise HTTPException(status_code=503, detail="Redis unreachable")
 
 @app.post("/api/notes", response_model=CreateResponse)
 async def create_note(note: NoteCreate, request: Request):
     ip = get_client_ip(request)
 
-    # Size check
+    if not await check_rate_limit(ip, "create", RATE_LIMIT_CREATE):
+        log.warning("action=rate_limit_create ip=%s", ip)
+        raise HTTPException(status_code=429, detail="Too many requests — slow down")
+
+    # Size checks
     if len(note.contents.encode()) > SIZE_LIMIT_BYTES:
         raise HTTPException(status_code=413, detail="Note too large")
+    # meta size is enforced by the Pydantic validator above
 
     if note.views is None and note.expiration is None:
         raise HTTPException(status_code=400, detail="At least views or expiration must be set")
@@ -147,7 +202,6 @@ async def create_note(note: NoteCreate, request: Request):
         "created": int(time.time()),
     }
 
-    import json
     key = f"note:{note_id}"
     await redis_client.set(key, json.dumps(payload))
     if expiry_seconds:
@@ -161,7 +215,11 @@ async def create_note(note: NoteCreate, request: Request):
 async def preview_note(note_id: str, request: Request):
     """Return note metadata without consuming a view."""
     ip = get_client_ip(request)
-    import json
+
+    if not await check_rate_limit(ip, "read", RATE_LIMIT_READ):
+        log.warning("action=rate_limit_read ip=%s", ip)
+        raise HTTPException(status_code=429, detail="Too many requests — slow down")
+
     key = f"note:{note_id}"
     raw = await redis_client.get(key)
     if raw is None:
@@ -176,10 +234,16 @@ async def preview_note(note_id: str, request: Request):
 async def consume_note(note_id: str, request: Request):
     """Consume (read + maybe destroy) a note."""
     ip = get_client_ip(request)
-    import json
+
+    if not await check_rate_limit(ip, "read", RATE_LIMIT_READ):
+        log.warning("action=rate_limit_read ip=%s", ip)
+        raise HTTPException(status_code=429, detail="Too many requests — slow down")
+
     key = f"note:{note_id}"
 
-    # Use a Lua script for atomic read-decrement-or-delete
+    # Atomic read-decrement-or-delete using a Lua script.
+    # Uses KEEPTTL (Redis ≥ 6.0) so time-based expiry is preserved when
+    # decrementing a view-counted note that also has a TTL set.
     lua_script = """
 local key = KEYS[1]
 local raw = redis.call('GET', key)
@@ -193,8 +257,8 @@ if data.views then
     data.views = 0
   else
     data.views = data.views - 1
-    redis.call('SET', key, cjson.encode(data))
-    -- preserve TTL if expiration-based
+    -- KEEPTTL preserves any existing TTL on the key (Redis >= 6.0)
+    redis.call('SET', key, cjson.encode(data), 'KEEPTTL')
   end
 end
 return cjson.encode(data)
@@ -211,13 +275,11 @@ return cjson.encode(data)
 
 
 # ── Static frontend (catch-all, must be last) ─────────────────────────────────
-# Serve the SPA index.html for all unknown routes so /note/[id] works
 from starlette.middleware.base import BaseHTTPMiddleware
 
 class SPAMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
-        # If a static file wasn't found, serve index.html
         if response.status_code == 404 and not request.url.path.startswith("/api"):
             return FileResponse(f"{FRONTEND_PATH}/index.html")
         return response
