@@ -1,6 +1,7 @@
 # Emerald Password Share
 
-Secure, self-destructing encrypted note and file sharing for Emerald Group.
+Secure, self-destructing encrypted note and file sharing for The Emerald Group.
+Inspired by 
 
 ## Stack
 
@@ -33,6 +34,8 @@ docker compose up --build -d
 ```
 
 App runs at **http://localhost:8001**
+
+Needs an SSL to generate note
 
 ## Environment variables
 
