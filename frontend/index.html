@@ -1,0 +1,877 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Emerald Password Share</title>
+<style>
+/* ── Reset & Base ─────────────────────────────────────────────────── */
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --c0:#0a0a0a;
+  --c1:#111;
+  --c2:#1a1a1a;
+  --c3:#252525;
+  --c4:#333;
+  --c5:#444;
+  --t0:#f0f0f0;
+  --t1:#aaa;
+  --t2:#666;
+  --green:hsl(157,60%,45%);
+  --green-dim:hsl(157,40%,28%);
+  --green-glow:hsl(157,60%,45%,0.15);
+  --red:hsl(0,68%,55%);
+  --red-dim:hsl(0,50%,25%);
+  --mono:'Fira Code','Cascadia Code','JetBrains Mono','Courier New',monospace;
+  --sans:system-ui,-apple-system,sans-serif;
+  --radius:2px;
+  --ease:cubic-bezier(0.4,0,0.2,1);
+  --t:150ms;
+}
+html{font-size:15px;-webkit-text-size-adjust:100%}
+body{
+  font-family:var(--mono);
+  background:var(--c0);
+  color:var(--t0);
+  min-height:100dvh;
+  line-height:1.6;
+  -webkit-font-smoothing:antialiased;
+}
+
+/* ── Layout ───────────────────────────────────────────────────────── */
+#root{
+  min-height:100dvh;
+  display:grid;
+  grid-template-rows:auto 1fr auto;
+}
+.wrap{width:100%;max-width:560px;margin:0 auto;padding:0 1.25rem}
+
+/* ── Header ───────────────────────────────────────────────────────── */
+header{
+  padding:2rem 0 1.5rem;
+  text-align:center;
+  border-bottom:1px solid var(--c3);
+}
+.logo-img{max-height:56px;max-width:100%;object-fit:contain;display:block;margin:0 auto}
+.logo-text{
+  font-size:1.05rem;font-weight:500;letter-spacing:0.12em;
+  color:var(--green);text-transform:uppercase;
+}
+.logo-text em{color:var(--t1);font-style:normal}
+
+/* ── Main ─────────────────────────────────────────────────────────── */
+main{padding:2rem 0 4rem}
+
+/* ── Footer ───────────────────────────────────────────────────────── */
+footer{
+  border-top:1px solid var(--c3);
+  padding:1rem 0;
+  text-align:center;
+  font-size:0.72rem;
+  color:var(--t2);
+}
+
+/* ── Typography ───────────────────────────────────────────────────── */
+.label{
+  display:block;
+  font-size:0.68rem;
+  letter-spacing:0.12em;
+  text-transform:uppercase;
+  color:var(--t2);
+  margin-bottom:0.35rem;
+}
+.hint{font-size:0.75rem;color:var(--t2);line-height:1.5;margin-bottom:1rem}
+.error{color:var(--red);font-size:0.78rem;margin-top:0.4rem}
+.warning{
+  background:var(--red-dim);
+  border:1px solid var(--red);
+  padding:0.6rem 0.8rem;
+  font-size:0.78rem;
+  color:#ffaaaa;
+  margin-bottom:1.2rem;
+  border-radius:var(--radius);
+}
+.warning strong{color:#ff8888}
+
+/* ── Inputs ───────────────────────────────────────────────────────── */
+input,textarea{
+  width:100%;
+  background:var(--c2);
+  border:1px solid var(--c4);
+  color:var(--t0);
+  font-family:var(--mono);
+  font-size:0.87rem;
+  padding:0.6rem 0.75rem;
+  outline:none;
+  border-radius:var(--radius);
+  transition:border-color var(--t) var(--ease);
+  -webkit-appearance:none;
+  appearance:none;
+}
+input:focus,textarea:focus{border-color:var(--green)}
+input[readonly]{color:var(--t1);cursor:text}
+input[type=number]{-moz-appearance:textfield}
+input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none}
+textarea{
+  resize:vertical;
+  min-height:clamp(140px,30vh,260px);
+  line-height:1.65;
+}
+.input-row{display:flex;gap:0.5rem;align-items:stretch}
+.input-row input{flex:1}
+
+/* ── Buttons ──────────────────────────────────────────────────────── */
+button{font-family:var(--mono);border-radius:var(--radius);cursor:pointer;transition:all var(--t) var(--ease);font-size:0.85rem;border:none}
+.btn-primary{
+  background:var(--green);
+  color:#000;
+  font-weight:600;
+  padding:0.6rem 1.4rem;
+  letter-spacing:0.04em;
+}
+.btn-primary:hover{filter:brightness(1.1)}
+.btn-primary:active{transform:translateY(1px)}
+.btn-primary:disabled{opacity:0.4;pointer-events:none}
+.btn-outline{
+  background:transparent;
+  border:1px solid var(--c5);
+  color:var(--t1);
+  padding:0.55rem 1rem;
+}
+.btn-outline:hover{border-color:var(--green);color:var(--green)}
+.btn-ghost{
+  background:transparent;
+  border:1px solid var(--c4);
+  color:var(--t2);
+  padding:0.5rem 0.8rem;
+  font-size:0.78rem;
+}
+.btn-ghost:hover{border-color:var(--t1);color:var(--t1)}
+.btn-icon{
+  background:var(--c3);
+  border:1px solid var(--c4);
+  color:var(--t1);
+  padding:0 0.75rem;
+  white-space:nowrap;
+  height:100%;
+}
+.btn-icon:hover{border-color:var(--green);color:var(--green)}
+
+/* ── Pill toggle (text/file) ──────────────────────────────────────── */
+.mode-toggle{
+  display:inline-flex;
+  background:var(--c2);
+  border:1px solid var(--c4);
+  border-radius:4px;
+  padding:2px;
+  gap:2px;
+  margin-bottom:1.25rem;
+}
+.mode-btn{
+  background:transparent;border:none;
+  padding:0.3rem 1rem;font-size:0.78rem;letter-spacing:0.06em;text-transform:uppercase;
+  color:var(--t2);border-radius:3px;
+  transition:all var(--t) var(--ease);
+}
+.mode-btn.active{background:var(--c4);color:var(--t0)}
+
+/* ── Toggle switch ────────────────────────────────────────────────── */
+.toggle-row{
+  display:flex;align-items:center;gap:0.6rem;
+  font-size:0.8rem;color:var(--t1);cursor:pointer;user-select:none;
+}
+.sw{
+  width:34px;height:18px;flex-shrink:0;
+  background:var(--c4);border-radius:9px;
+  position:relative;transition:background var(--t) var(--ease);
+}
+.sw::after{
+  content:'';position:absolute;
+  top:3px;left:3px;width:12px;height:12px;
+  background:var(--t2);border-radius:50%;
+  transition:all var(--t) var(--ease);
+}
+.sw.on{background:var(--green-dim)}
+.sw.on::after{background:var(--green);left:19px}
+
+/* ── Field group ──────────────────────────────────────────────────── */
+.field{margin-bottom:1.1rem}
+.field:last-child{margin-bottom:0}
+.row-2{display:grid;grid-template-columns:1fr 1fr;gap:0.75rem}
+
+/* ── File drop zone ───────────────────────────────────────────────── */
+.dropzone{
+  border:1px dashed var(--c5);
+  border-radius:var(--radius);
+  padding:2rem;
+  text-align:center;
+  cursor:pointer;
+  transition:all var(--t) var(--ease);
+  background:var(--c2);
+  min-height:120px;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:0.5rem;
+}
+.dropzone:hover,.dropzone.dragover{border-color:var(--green);background:var(--green-glow)}
+.dropzone-icon{font-size:1.8rem;opacity:0.4}
+.dropzone-label{font-size:0.8rem;color:var(--t2)}
+.file-list{list-style:none;margin-top:0.8rem;width:100%;text-align:left}
+.file-list li{
+  display:flex;justify-content:space-between;align-items:center;
+  padding:0.35rem 0.5rem;font-size:0.78rem;
+  background:var(--c3);border-radius:2px;margin-bottom:3px;
+}
+.file-list li span{color:var(--t2);font-size:0.72rem}
+
+/* ── Advanced section ─────────────────────────────────────────────── */
+.advanced{
+  border-top:1px solid var(--c3);
+  margin-top:1.2rem;
+  padding-top:1.2rem;
+  display:none;
+}
+.advanced.open{display:block}
+
+/* ── Bottom bar ───────────────────────────────────────────────────── */
+.bottom-bar{
+  display:flex;align-items:center;justify-content:space-between;
+  margin-top:1rem;flex-wrap:wrap;gap:0.6rem;
+}
+.bottom-bar-left{display:flex;align-items:center;gap:1rem;flex-wrap:wrap}
+.max-label{font-size:0.72rem;color:var(--t2)}
+.status-msg{font-size:0.78rem;color:var(--t2);margin-top:0.6rem;min-height:1.2rem}
+
+/* ── Note result display ──────────────────────────────────────────── */
+.note-box{
+  background:var(--c2);
+  border:1px solid var(--c4);
+  border-radius:var(--radius);
+  padding:1rem;
+  white-space:pre-wrap;
+  word-break:break-word;
+  font-size:0.85rem;
+  line-height:1.7;
+  max-height:320px;
+  overflow-y:auto;
+  margin-bottom:0.8rem;
+}
+.file-dl-row{
+  display:flex;justify-content:space-between;align-items:center;
+  border:1px solid var(--c4);border-radius:var(--radius);
+  padding:0.5rem 0.75rem;margin-bottom:0.4rem;background:var(--c2);
+}
+.file-dl-name{font-size:0.82rem}
+.file-dl-meta{font-size:0.72rem;color:var(--t2)}
+.file-dl-btn{
+  background:transparent;border:none;color:var(--green);
+  font-family:var(--mono);font-size:0.82rem;cursor:pointer;font-weight:600;
+}
+.file-dl-btn:hover{text-decoration:underline}
+
+/* ── Links found ──────────────────────────────────────────────────── */
+.links-box{margin-top:1rem;font-size:0.78rem}
+.links-box p{color:var(--t2);margin-bottom:0.4rem}
+.links-box a{color:var(--green);word-break:break-all;display:block;margin-bottom:0.2rem}
+
+/* ── Share result card ────────────────────────────────────────────── */
+.result-card{
+  background:var(--c2);
+  border:1px solid var(--c4);
+  border-radius:4px;
+  padding:1.5rem;
+}
+.result-card h2{font-size:0.85rem;letter-spacing:0.1em;text-transform:uppercase;color:var(--t2);margin-bottom:1.2rem}
+.result-actions{display:flex;gap:0.5rem;margin-top:1rem;flex-wrap:wrap}
+
+/* ── Loading spinner ──────────────────────────────────────────────── */
+.spinner{
+  display:inline-block;width:14px;height:14px;
+  border:2px solid var(--c5);border-top-color:var(--green);
+  border-radius:50%;animation:spin 0.7s linear infinite;
+  vertical-align:middle;margin-left:0.4rem;
+}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* ── Toast ────────────────────────────────────────────────────────── */
+#toasts{
+  position:fixed;bottom:1.5rem;right:1.5rem;
+  display:flex;flex-direction:column-reverse;gap:0.5rem;
+  z-index:1000;pointer-events:none;
+}
+.toast{
+  background:var(--c3);border:1px solid var(--c5);
+  padding:0.5rem 1rem;font-size:0.78rem;border-radius:var(--radius);
+  color:var(--t0);animation:toastIn 0.2s var(--ease);
+  max-width:300px;
+}
+.toast.ok{border-left:3px solid var(--green)}
+.toast.err{border-left:3px solid var(--red);color:#ffaaaa}
+@keyframes toastIn{from{transform:translateX(1rem);opacity:0}to{transform:none;opacity:1}}
+
+/* ── Divider ──────────────────────────────────────────────────────── */
+.divider{border:none;border-top:1px solid var(--c3);margin:1.5rem 0}
+
+/* ── Password prompt ──────────────────────────────────────────────── */
+.pw-card{max-width:400px}
+.pw-card p{font-size:0.82rem;color:var(--t1);margin-bottom:1.2rem}
+
+/* ── Responsive ───────────────────────────────────────────────────── */
+@media(max-width:500px){
+  header{padding:1.5rem 0 1rem}
+  .row-2{grid-template-columns:1fr}
+}
+
+/* ── Page transitions ─────────────────────────────────────────────── */
+.page{animation:fadeIn 0.18s var(--ease)}
+@keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+</style>
+</head>
+<body>
+<div id="root">
+  <header>
+    <div class="wrap">
+      <div id="logoArea">
+        <div class="logo-text">emerald <em>password share</em></div>
+      </div>
+    </div>
+  </header>
+  <main>
+    <div class="wrap">
+      <div id="app"><div style="color:var(--t2);font-size:0.82rem;padding-top:2rem">Loading…<span class="spinner"></span></div></div>
+    </div>
+  </main>
+  <footer>
+    <div class="wrap">
+      <span id="footerVer">Emerald Password Share</span>
+    </div>
+  </footer>
+</div>
+<div id="toasts"></div>
+
+<script>
+/* ═══════════════════════════════════════════════════════════════════
+   UTILITIES
+═══════════════════════════════════════════════════════════════════ */
+const $ = id => document.getElementById(id)
+const html = (s,p={}) => s.replace(/\{\{(\w+)\}\}/g, (_,k) => esc(p[k]??''))
+
+function esc(s){
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;')
+}
+
+function render(content){
+  const app = $('app')
+  app.innerHTML = ''
+  if(typeof content === 'string'){
+    app.innerHTML = content
+  } else {
+    app.appendChild(content)
+  }
+}
+
+function fmtBytes(b){
+  if(b < 1024) return b + ' B'
+  if(b < 1048576) return (b/1024).toFixed(1) + ' KB'
+  return (b/1048576).toFixed(1) + ' MB'
+}
+
+function toast(msg, type='ok'){
+  const wrap = $('toasts')
+  const el = document.createElement('div')
+  el.className = `toast ${type}`
+  el.textContent = msg
+  wrap.appendChild(el)
+  setTimeout(()=>{ el.style.transition='opacity 0.3s'; el.style.opacity='0'; setTimeout(()=>el.remove(),320) }, 3200)
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   CRYPTO  (WebCrypto AES-GCM-256 + PBKDF2)
+═══════════════════════════════════════════════════════════════════ */
+const toHex = buf => Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('')
+const fromHex = str => new Uint8Array((str.match(/.{2}/g)||[]).map(h=>parseInt(h,16)))
+
+async function genKey(){
+  return crypto.subtle.generateKey({name:'AES-GCM',length:256},true,['encrypt','decrypt'])
+}
+async function exportKeyHex(k){ return toHex(await crypto.subtle.exportKey('raw',k)) }
+async function importKeyHex(hex, usage=['decrypt']){
+  return crypto.subtle.importKey('raw',fromHex(hex),{name:'AES-GCM'},false,usage)
+}
+async function deriveKey(password, saltHex){
+  const enc = new TextEncoder()
+  const salt = saltHex ? fromHex(saltHex) : crypto.getRandomValues(new Uint8Array(16))
+  const base = await crypto.subtle.importKey('raw',enc.encode(password),{name:'PBKDF2'},false,['deriveKey'])
+  const key  = await crypto.subtle.deriveKey(
+    {name:'PBKDF2',salt,iterations:200000,hash:'SHA-256'},
+    base,{name:'AES-GCM',length:256},false,['encrypt','decrypt']
+  )
+  return {key, saltHex: toHex(salt)}
+}
+async function encrypt(plainBytes, key){
+  const iv = crypto.getRandomValues(new Uint8Array(12))
+  const ct = await crypto.subtle.encrypt({name:'AES-GCM',iv},key,plainBytes)
+  return toHex(iv) + toHex(ct)
+}
+async function encryptText(text, key){ return encrypt(new TextEncoder().encode(text), key) }
+async function encryptFiles(files, key){
+  const data = await Promise.all(files.map(async f=>{
+    const buf = await f.arrayBuffer()
+    return {name:f.name,size:f.size,type:f.type||'application/octet-stream',contents:Array.from(new Uint8Array(buf))}
+  }))
+  return encryptText(JSON.stringify(data), key)
+}
+async function decryptToText(hexStr, key){
+  const b = fromHex(hexStr)
+  const pt = await crypto.subtle.decrypt({name:'AES-GCM',iv:b.slice(0,12)},key,b.slice(12))
+  return new TextDecoder().decode(pt)
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   API
+═══════════════════════════════════════════════════════════════════ */
+async function apiGet(path){
+  const r = await fetch(path)
+  if(!r.ok) throw Object.assign(new Error('api'),{status:r.status})
+  return r.json()
+}
+async function apiPost(path, body){
+  const r = await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+  if(!r.ok) throw Object.assign(new Error('api'),{status:r.status})
+  return r.json()
+}
+async function apiDelete(path){
+  const r = await fetch(path,{method:'DELETE'})
+  if(!r.ok) throw Object.assign(new Error('api'),{status:r.status})
+  return r.json()
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   ROUTER
+═══════════════════════════════════════════════════════════════════ */
+let _status = null
+
+async function boot(){
+  try{ _status = await apiGet('/api/status') }catch{}
+  applyTheme(_status)
+  const m = location.pathname.match(/^\/note\/([A-Za-z0-9_-]+)\/?$/)
+  if(m) await pageNote(m[1])
+  else   await pageHome()
+}
+
+function applyTheme(s){
+  if(!s) return
+  if(s.theme_page_title) document.title = s.theme_page_title
+  if(s.theme_favicon){
+    let l = document.querySelector("link[rel~='icon']")||document.createElement('link')
+    l.rel='icon'; l.href=s.theme_favicon; document.head.appendChild(l)
+  }
+  if(s.theme_image){
+    $('logoArea').innerHTML=`<a href="/"><img class="logo-img" src="${esc(s.theme_image)}" alt="Logo"/></a>`
+  }
+  $('footerVer').textContent = `Emerald Password Share v${s.version||''}`
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   HOME PAGE
+═══════════════════════════════════════════════════════════════════ */
+const _home = {
+  mode: 'text',   // 'text' | 'file'
+  advanced: false,
+  timeMode: false,
+  files: [],
+  busy: false,
+}
+
+async function pageHome(){
+  const s = _status
+  const maxMB = s ? fmtBytes(s.max_size) : '80 MB'
+  const allowAdv  = s ? s.allow_advanced : true
+  const allowFile = s ? s.allow_files    : true
+  const introText = s?.theme_text
+    || 'Easily send <span style="color:var(--green)">fully encrypted</span> notes and files. The link is the key — share it once.'
+
+  render(`<div class="page">
+    <p style="font-size:0.82rem;color:var(--t1);margin-bottom:1.5rem;line-height:1.6">${introText}</p>
+
+    ${allowFile ? `
+    <div class="mode-toggle">
+      <button class="mode-btn ${_home.mode==='text'?'active':''}" id="btnModeText" onclick="setMode('text')">Text</button>
+      <button class="mode-btn ${_home.mode==='file'?'active':''}" id="btnModeFile" onclick="setMode('file')">File</button>
+    </div>` : ''}
+
+    <div id="inputArea"></div>
+
+    <div class="bottom-bar">
+      <div class="bottom-bar-left">
+        ${allowAdv ? `<label class="toggle-row" onclick="toggleAdvanced()">
+          <div id="advSW" class="sw${_home.advanced?' on':''}"></div>
+          Advanced
+        </label>` : ''}
+        <span class="max-label">Max ${maxMB}</span>
+      </div>
+      <button class="btn-primary" id="submitBtn" onclick="handleCreate()" ${_home.busy?'disabled':''}>
+        Create note
+      </button>
+    </div>
+
+    <p class="status-msg" id="statusMsg">${describeExpiry()}</p>
+
+    ${allowAdv ? `
+    <div class="advanced${_home.advanced?' open':''}" id="advPanel">
+      <div class="row-2">
+        <div class="field">
+          <span class="label" id="limitLabel">${_home.timeMode?'Minutes':'Views'}</span>
+          <input type="number" id="limitVal" value="${_home.timeMode?60:1}" min="1"
+            max="${_home.timeMode?(s?.max_expiration||360):(s?.max_views||100)}"
+            oninput="updateStatus()"/>
+        </div>
+        <div class="field" style="display:flex;align-items:flex-end;padding-bottom:0.1rem">
+          <label class="toggle-row" onclick="toggleTimeMode()">
+            <div id="timeSW" class="sw${_home.timeMode?' on':''}"></div>
+            Time-based
+          </label>
+        </div>
+      </div>
+      <div class="field">
+        <span class="label">Custom password <span style="color:var(--t2);font-size:0.65rem">(optional — not in link)</span></span>
+        <input type="password" id="customPw" placeholder="Leave blank for auto-generated key"/>
+      </div>
+      <p class="hint">Custom passwords are never included in the share link. The recipient will need it separately.</p>
+    </div>` : ''}
+  </div>`)
+
+  renderInputArea()
+}
+
+function renderInputArea(){
+  const area = $('inputArea')
+  if(!area) return
+  if(_home.mode === 'text'){
+    area.innerHTML = `<div class="field">
+      <span class="label">Note</span>
+      <textarea id="noteText" placeholder="Type your secure note here…"></textarea>
+    </div>`
+  } else {
+    area.innerHTML = `<div class="field">
+      <span class="label">Files</span>
+      <div class="dropzone" id="dropzone"
+        onclick="$('fileInput').click()"
+        ondragover="onDragOver(event)"
+        ondragleave="onDragLeave(event)"
+        ondrop="onDrop(event)">
+        <input type="file" id="fileInput" multiple style="display:none" onchange="onFileChange(event)"/>
+        <div id="dropContent">
+          <div class="dropzone-icon">⬆</div>
+          <div class="dropzone-label">Click or drag files here</div>
+        </div>
+      </div>
+    </div>`
+    renderFileList()
+  }
+}
+
+function renderFileList(){
+  const c = $('dropContent')
+  if(!c) return
+  if(_home.files.length === 0){
+    c.innerHTML = `<div class="dropzone-icon">⬆</div><div class="dropzone-label">Click or drag files here</div>`
+  } else {
+    c.innerHTML = `<ul class="file-list">${
+      _home.files.map((f,i)=>`<li>
+        <span>${esc(f.name)}</span>
+        <span>${fmtBytes(f.size)} <button onclick="removeFile(event,${i})" style="background:none;border:none;color:var(--red);cursor:pointer;font-size:0.9rem;padding:0 0 0 0.3rem">×</button></span>
+      </li>`).join('')
+    }</ul>
+    <div class="dropzone-label" style="margin-top:0.5rem;font-size:0.72rem">Click to add more</div>`
+  }
+}
+
+function setMode(mode){
+  _home.mode = mode
+  _home.files = []
+  document.querySelectorAll('.mode-btn').forEach(b=>b.classList.remove('active'))
+  $(`btnMode${mode==='text'?'Text':'File'}`)?.classList.add('active')
+  renderInputArea()
+}
+
+function onDragOver(e){ e.preventDefault(); $('dropzone')?.classList.add('dragover') }
+function onDragLeave(){ $('dropzone')?.classList.remove('dragover') }
+function onDrop(e){
+  e.preventDefault(); $('dropzone')?.classList.remove('dragover')
+  _home.files.push(...Array.from(e.dataTransfer.files))
+  renderFileList()
+}
+function onFileChange(e){ _home.files.push(...Array.from(e.target.files)); renderFileList() }
+function removeFile(e,i){ e.stopPropagation(); _home.files.splice(i,1); renderFileList() }
+
+function toggleAdvanced(){
+  _home.advanced = !_home.advanced
+  const sw = $('advSW')
+  if(sw) sw.classList.toggle('on', _home.advanced)
+  const panel = $('advPanel')
+  if(panel) panel.classList.toggle('open', _home.advanced)
+  if(!_home.advanced){ _home.timeMode=false; updateStatus() }
+}
+
+function toggleTimeMode(){
+  _home.timeMode = !_home.timeMode
+  const sw = $('timeSW'); if(sw) sw.classList.toggle('on',_home.timeMode)
+  const lbl = $('limitLabel'); if(lbl) lbl.textContent=_home.timeMode?'Minutes':'Views'
+  const inp = $('limitVal'); if(inp){ inp.value=_home.timeMode?60:1; inp.max=_home.timeMode?(_status?.max_expiration||360):(_status?.max_views||100) }
+  updateStatus()
+}
+
+function describeExpiry(){
+  if(!_home.advanced) return 'Note will self-destruct after 1 view.'
+  const v = $('limitVal')?.value || 1
+  if(_home.timeMode) return `Note will self-destruct after ${v} minute${v==1?'':'s'}.`
+  return `Note will self-destruct after ${v} view${v==1?'':'s'}.`
+}
+
+function updateStatus(){
+  const el = $('statusMsg'); if(el && !_home.busy) el.textContent = describeExpiry()
+}
+
+function setBusy(msg){
+  _home.busy = true
+  const btn = $('submitBtn'); if(btn){ btn.disabled=true; btn.innerHTML=`${msg}<span class="spinner"></span>` }
+  const sm = $('statusMsg'); if(sm) sm.innerHTML=`<span style="color:var(--t2)">${msg}<span class="spinner"></span></span>`
+}
+
+async function handleCreate(){
+  if(_home.busy) return
+  setBusy('Encrypting')
+
+  try{
+    const pw = $('customPw')?.value.trim() || ''
+    let key, derivation
+
+    if(pw){
+      const d = await deriveKey(pw, null)
+      key=d.key; derivation=d.saltHex
+    } else {
+      key = await genKey()
+    }
+
+    let contents, type
+    if(_home.mode === 'file'){
+      if(_home.files.length === 0){ toast('No files selected','err'); return }
+      contents = await encryptFiles(_home.files, key)
+      type = 'file'
+    } else {
+      const txt = $('noteText')?.value || ''
+      if(!txt.trim()){ toast('Note is empty','err'); return }
+      contents = await encryptText(txt, key)
+      type = 'text'
+    }
+
+    const meta = {type}
+    if(derivation) meta.derivation = derivation
+
+    const limitVal = parseInt($('limitVal')?.value||'1') || 1
+    const payload = {contents, meta: JSON.stringify(meta)}
+    if(_home.advanced && _home.timeMode) payload.expiration = limitVal
+    else payload.views = _home.advanced ? limitVal : 1
+
+    setBusy('Uploading')
+    const resp = await apiPost('/api/notes', payload)
+    const keyHex = pw ? null : await exportKeyHex(key)
+    const url = `${location.origin}/note/${resp.id}${keyHex?'#'+keyHex:''}`
+
+    toast('Note created successfully','ok')
+    pageResult(url, pw)
+  } catch(err){
+    if(err.status===413) toast('Note is too large','err')
+    else toast('Failed to create note. Please try again.','err')
+    console.error(err)
+    _home.busy = false
+    // Re-render to restore button
+    await pageHome()
+  }
+}
+
+function pageResult(url, hasCustomPw){
+  const mailto = `mailto:support@emerald-group.co.uk?subject=${encodeURIComponent('Shared secure note')}&body=${encodeURIComponent(url)}`
+  render(`<div class="page">
+    <div class="result-card">
+      <h2>Note created</h2>
+      <div class="field">
+        <span class="label">Share link</span>
+        <div class="input-row">
+          <input type="text" id="shareUrl" readonly value="${esc(url)}"/>
+          <button class="btn-icon" onclick="copyUrl()">Copy</button>
+        </div>
+      </div>
+      ${hasCustomPw ? `<p class="hint" style="margin-top:0.5rem">⚠ Password is required to open this note — share it separately.</p>` : ''}
+      <div class="result-actions">
+        <a href="${esc(mailto)}" style="text-decoration:none">
+          <button class="btn-outline">✉ Send via email</button>
+        </a>
+        <button class="btn-ghost" onclick="startOver()">New note</button>
+      </div>
+    </div>
+  </div>`)
+}
+
+function copyUrl(){
+  const url = $('shareUrl')?.value||''
+  navigator.clipboard.writeText(url).then(()=>toast('Copied to clipboard','ok'))
+}
+
+function startOver(){
+  _home.mode='text'; _home.advanced=false; _home.timeMode=false; _home.files=[]; _home.busy=false
+  pageHome()
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   NOTE VIEW PAGE
+═══════════════════════════════════════════════════════════════════ */
+async function pageNote(id){
+  const hashKey = location.hash.slice(1)
+
+  render(`<div style="color:var(--t2);font-size:0.82rem;padding-top:1rem">Checking…<span class="spinner"></span></div>`)
+
+  let meta
+  try{
+    const info = await apiGet(`/api/notes/${id}`)
+    meta = JSON.parse(info.meta || '{}')
+  } catch(e){
+    render(`<div class="page">
+      <p style="color:var(--red);margin-bottom:1rem">This note was not found, has already been viewed, or has expired.</p>
+      <a href="/"><button class="btn-ghost">← Create a new note</button></a>
+    </div>`)
+    return
+  }
+
+  if(meta.derivation){
+    renderPasswordPrompt(id, meta)
+  } else if(hashKey){
+    renderRevealButton(id, meta, hashKey)
+  } else {
+    render(`<div class="page">
+      <p style="color:var(--red);margin-bottom:1rem">Decryption key missing — the link may be incomplete.</p>
+      <a href="/"><button class="btn-ghost">← Create a new note</button></a>
+    </div>`)
+  }
+}
+
+function renderRevealButton(id, meta, hashKey){
+  render(`<div class="page">
+    <p style="font-size:0.82rem;color:var(--t1);margin-bottom:1.5rem">
+      This note will be permanently deleted once you reveal it.<br/>
+      <strong style="color:var(--t0)">You will not be able to see it again.</strong>
+    </p>
+    <button class="btn-primary" id="revealBtn" onclick="revealNote('${esc(id)}',null,'${esc(hashKey)}')">Reveal note</button>
+    <p id="revealErr" class="error" style="display:none"></p>
+  </div>`)
+  window._noteMeta = meta
+}
+
+function renderPasswordPrompt(id, meta){
+  render(`<div class="page pw-card">
+    <p>This note is protected with a custom password.<br/>Enter it below to decrypt and reveal the note.</p>
+    <div class="field">
+      <span class="label">Password</span>
+      <input type="password" id="pwInput" placeholder="Enter password…"/>
+    </div>
+    <button class="btn-primary" id="revealBtn" onclick="revealNote('${esc(id)}','pw',null)">Reveal note</button>
+    <p id="revealErr" class="error" style="display:none"></p>
+  </div>`)
+  window._noteMeta = meta
+}
+
+async function revealNote(id, pwMode, hashKey){
+  const btn = $('revealBtn'); if(!btn) return
+  const errEl = $('revealErr')
+  btn.disabled=true; btn.innerHTML=`Decrypting<span class="spinner"></span>`
+  if(errEl) errEl.style.display='none'
+
+  try{
+    const data = await apiDelete(`/api/notes/${id}`)
+    const meta = window._noteMeta || {}
+    let key
+
+    if(pwMode === 'pw'){
+      const pw = $('pwInput')?.value
+      if(!pw){ throw Object.assign(new Error('No password'))}
+      const d = await deriveKey(pw, meta.derivation)
+      key = d.key
+    } else {
+      key = await importKeyHex(hashKey)
+    }
+
+    const plaintext = await decryptToText(data.contents, key)
+
+    if(meta.type === 'file'){
+      renderDecryptedFiles(JSON.parse(plaintext))
+    } else {
+      renderDecryptedText(plaintext)
+    }
+  } catch(e){
+    const msg = e.status===404
+      ? 'Note not found — it may have already been viewed.'
+      : 'Decryption failed. Wrong password or broken link.'
+    if(errEl){ errEl.textContent=msg; errEl.style.display='block' }
+    if(btn){ btn.disabled=false; btn.textContent='Try again' }
+  }
+}
+
+function renderDecryptedText(text){
+  const urlRe = /[A-Za-z][A-Za-z0-9+\-.]*:\/\/[^\s<>"']+/g
+  const links  = [...new Set(text.match(urlRe)||[])]
+  window._plaintext = text
+
+  render(`<div class="page">
+    <div class="warning">⚠ <strong>This is your one chance</strong> to read this note. It has been permanently deleted.</div>
+    <div class="note-box">${esc(text)}</div>
+    <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:1rem">
+      <button class="btn-outline" onclick="copyPlaintext()">Copy to clipboard</button>
+      <a href="/"><button class="btn-ghost">← New note</button></a>
+    </div>
+    ${links.length ? `<div class="links-box">
+      <p>Links found in this note:</p>
+      ${links.map(l=>`<a href="${esc(l)}" target="_blank" rel="noopener noreferrer">${esc(l)}</a>`).join('')}
+    </div>` : ''}
+  </div>`)
+}
+
+function copyPlaintext(){
+  navigator.clipboard.writeText(window._plaintext||'').then(()=>toast('Copied','ok'))
+}
+
+function renderDecryptedFiles(files){
+  window._decFiles = files
+  render(`<div class="page">
+    <div class="warning">⚠ <strong>This is your one chance</strong> to download these files. They have been permanently deleted.</div>
+    ${files.map((f,i)=>`
+      <div class="file-dl-row">
+        <div>
+          <div class="file-dl-name">${esc(f.name)}</div>
+          <div class="file-dl-meta">${esc(f.type)} · ${fmtBytes(f.size)}</div>
+        </div>
+        <button class="file-dl-btn" onclick="dlFile(${i})">↓ Download</button>
+      </div>`).join('')}
+    <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-top:0.8rem">
+      <button class="btn-outline" onclick="dlAll()">↓ Download all</button>
+      <a href="/"><button class="btn-ghost">← New note</button></a>
+    </div>
+  </div>`)
+}
+
+function dlFile(i){
+  const f = window._decFiles[i]
+  const blob = new Blob([new Uint8Array(f.contents)],{type:f.type||'application/octet-stream'})
+  const a = Object.assign(document.createElement('a'),{href:URL.createObjectURL(blob),download:f.name})
+  a.click(); URL.revokeObjectURL(a.href)
+}
+
+function dlAll(){ (window._decFiles||[]).forEach((_,i)=>dlFile(i)) }
+
+/* ═══════════════════════════════════════════════════════════════════
+   BOOT
+═══════════════════════════════════════════════════════════════════ */
+boot().catch(console.error)
+</script>
+</body>
+</html>

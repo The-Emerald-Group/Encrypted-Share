@@ -1,0 +1,23 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: redis-server --save "" --appendonly no
+    tmpfs:
+      - /data
+    restart: unless-stopped
+
+  app:
+    image: emerald-cryptgeon:latest
+    depends_on:
+      - redis
+    environment:
+      REDIS: redis://redis/
+      SIZE_LIMIT_BYTES: "83886080"   # 80 MiB
+      MAX_VIEWS: "100"
+      MAX_EXPIRATION: "360"          # minutes (6 hours)
+      ALLOW_ADVANCED: "true"
+      ALLOW_FILES: "true"
+      VERBOSITY: "INFO"
+    ports:
+      - "8001:8000"
+    restart: unless-stopped
