@@ -7,7 +7,7 @@ services:
     restart: unless-stopped
 
   app:
-    image: emerald-cryptgeon:latest
+    image:  encrypt-share:latest 
     depends_on:
       - redis
     environment:
