@@ -24,8 +24,4 @@ ENV VERBOSITY="INFO"
 
 EXPOSE 8000
 
-# Uses /api/live which performs a real Redis round-trip, not just a ping
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD wget -qO- http://localhost:8000/api/live || exit 1
-
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips=*"]
