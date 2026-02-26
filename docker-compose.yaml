@@ -7,7 +7,7 @@ services:
     restart: unless-stopped
 
   app:
-    image:  encrypt-share:latest 
+    image:  samuelstreets/encrypted-share:latest 
     depends_on:
       - redis
     environment:
