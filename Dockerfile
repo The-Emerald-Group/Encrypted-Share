@@ -1,12 +1,12 @@
 # ── Builder: install Python deps ─────────────────────────────────────────────
-FROM python:3.13-alpine AS builder
+FROM python:3.14.0-alpine AS builder
 
 WORKDIR /build
 COPY app/requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 # ── Runner ────────────────────────────────────────────────────────────────────
-FROM python:3.13-alpine
+FROM python:3.14.0-alpine
 
 WORKDIR /app
 
