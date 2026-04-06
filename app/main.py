@@ -31,8 +31,12 @@ MAX_EXPIRATION   = int(os.getenv("MAX_EXPIRATION", "360"))  # minutes
 ALLOW_ADVANCED   = os.getenv("ALLOW_ADVANCED", "true").lower() == "true"
 ALLOW_FILES      = os.getenv("ALLOW_FILES", "true").lower() == "true"
 ID_LENGTH        = int(os.getenv("ID_LENGTH", "32"))
-RATE_LIMIT_CREATE = int(os.getenv("RATE_LIMIT_CREATE", "20"))   # per minute per IP
-RATE_LIMIT_READ   = int(os.getenv("RATE_LIMIT_READ",   "60"))   # per minute per IP
+RATE_LIMIT_CREATE = int(os.getenv("RATE_LIMIT_CREATE", "20"))    # per minute per IP
+RATE_LIMIT_READ   = int(os.getenv("RATE_LIMIT_READ",   "60"))    # per minute per IP
+# Chunks get their own generous bucket so multi-chunk uploads don't exhaust the
+# note-creation limit. Default 600 = 10 chunks/sec sustained, well above any
+# realistic upload speed while still blocking abuse.
+RATE_LIMIT_CHUNK  = int(os.getenv("RATE_LIMIT_CHUNK",  "600"))   # per minute per IP
 THEME_IMAGE      = os.getenv("THEME_IMAGE", "https://emerald-group.co.uk/wp-content/uploads/2022/10/Emeralds-Group-Logo-Lighter-text.svg")
 THEME_TEXT       = os.getenv("THEME_TEXT", "")
 THEME_PAGE_TITLE = os.getenv("THEME_PAGE_TITLE", "Emerald Password Share")
@@ -196,6 +200,7 @@ async def get_status():
         "theme_page_title": THEME_PAGE_TITLE,
         "theme_favicon": THEME_FAVICON,
         "chunk_size": CHUNK_SIZE_LIMIT,
+        "rate_limit_chunk": RATE_LIMIT_CHUNK,
     }
 
 @app.get("/api/live")
@@ -253,7 +258,7 @@ async def create_note(note: NoteCreate, request: Request):
 async def upload_chunk(chunk: ChunkUpload, request: Request):
     ip = get_client_ip(request)
 
-    if not await check_rate_limit(ip, "create", RATE_LIMIT_CREATE):
+    if not await check_rate_limit(ip, "chunk", RATE_LIMIT_CHUNK):
         log.warning("action=rate_limit_chunk ip=%s", ip)
         raise HTTPException(status_code=429, detail="Too many requests — slow down")
 
