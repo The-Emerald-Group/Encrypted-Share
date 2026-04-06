@@ -41,13 +41,9 @@ IMPRINT_URL      = os.getenv("IMPRINT_URL", "")
 IMPRINT_HTML     = os.getenv("IMPRINT_HTML", "")
 
 # Chunked upload config
-# Each chunk must be ≤ CHUNK_SIZE_LIMIT bytes (default 90 MiB — safely under CF's 100 MiB body limit)
 CHUNK_SIZE_LIMIT = int(os.getenv("CHUNK_SIZE_LIMIT", str(90 * 1024 * 1024)))
-# Total assembled payload across all chunks still respects SIZE_LIMIT_BYTES
-# Partial chunks expire from Redis after CHUNK_TTL seconds if never completed
 CHUNK_TTL        = int(os.getenv("CHUNK_TTL", "3600"))  # 1 hour
 
-# Version: read from VERSION file baked in at build time, fall back to env, then default
 def _read_version() -> str:
     try:
         with open(os.path.join(os.path.dirname(__file__), "VERSION")) as f:
@@ -104,8 +100,8 @@ class CreateResponse(BaseModel):
 
 # ── Chunked upload models ─────────────────────────────────────────────────────
 class ChunkUpload(BaseModel):
-    upload_id: str   # client-generated session ID for this upload
-    chunk_index: int # 0-based
+    upload_id: str
+    chunk_index: int
     total_chunks: int
     data: str        # hex-encoded chunk data
 
@@ -136,12 +132,8 @@ def get_client_ip(request: Request) -> str:
     return "unknown"
 
 async def check_rate_limit(ip: str, action: str, limit: int) -> bool:
-    """
-    Sliding-window rate limiter using a Redis sorted set.
-    Returns True if the request is allowed, False if the limit is exceeded.
-    """
     now = time.time()
-    window = 60  # 1 minute
+    window = 60
     key = f"rl:{action}:{ip}"
     pipe = redis_client.pipeline()
     pipe.zremrangebyscore(key, 0, now - window)
@@ -151,6 +143,40 @@ async def check_rate_limit(ip: str, action: str, limit: int) -> bool:
     results = await pipe.execute()
     count = results[2]
     return count <= limit
+
+# ── Storage helpers ───────────────────────────────────────────────────────────
+# Notes are stored as TWO Redis keys to avoid cjson's 8 MB string limit in Lua:
+#
+#   note:{id}          – small JSON: { meta, views, created }  (no contents)
+#   note:{id}:contents – raw hex ciphertext string (arbitrarily large)
+#
+# The Lua script in consume_note only decodes the small JSON key, then fetches
+# the contents key directly — completely bypassing the cjson ceiling.
+
+async def _store_note(
+    note_id: str,
+    contents: str,
+    meta: str,
+    views: Optional[int],
+    expiry_seconds: Optional[int],
+) -> None:
+    meta_key     = f"note:{note_id}"
+    contents_key = f"note:{note_id}:contents"
+
+    payload = {
+        "meta": meta,
+        "views": views,
+        "created": int(time.time()),
+    }
+
+    pipe = redis_client.pipeline()
+    pipe.set(meta_key,     json.dumps(payload))
+    pipe.set(contents_key, contents)
+    if expiry_seconds:
+        pipe.expire(meta_key,     expiry_seconds)
+        pipe.expire(contents_key, expiry_seconds)
+    await pipe.execute()
+
 
 # ── API routes ────────────────────────────────────────────────────────────────
 
@@ -174,10 +200,6 @@ async def get_status():
 
 @app.get("/api/live")
 async def health():
-    """
-    End-to-end health check: verifies Redis connectivity AND
-    that the app can perform a real read/write round-trip.
-    """
     try:
         probe_key = "healthcheck:probe"
         await redis_client.set(probe_key, "1", ex=5)
@@ -197,7 +219,6 @@ async def create_note(note: NoteCreate, request: Request):
         log.warning("action=rate_limit_create ip=%s", ip)
         raise HTTPException(status_code=429, detail="Too many requests — slow down")
 
-    # Size checks
     if len(note.contents.encode()) > SIZE_LIMIT_BYTES:
         raise HTTPException(status_code=413, detail="Note too large")
 
@@ -211,7 +232,7 @@ async def create_note(note: NoteCreate, request: Request):
     if note.views is not None:
         if note.views < 1 or note.views > MAX_VIEWS:
             raise HTTPException(status_code=400, detail=f"Views must be between 1 and {MAX_VIEWS}")
-        note.expiration = None  # views takes priority
+        note.expiration = None
 
     expiry_seconds: Optional[int] = None
     if note.expiration is not None:
@@ -220,17 +241,7 @@ async def create_note(note: NoteCreate, request: Request):
         expiry_seconds = note.expiration * 60
 
     note_id = generate_id()
-    payload = {
-        "contents": note.contents,
-        "meta": note.meta,
-        "views": note.views,
-        "created": int(time.time()),
-    }
-
-    key = f"note:{note_id}"
-    await redis_client.set(key, json.dumps(payload))
-    if expiry_seconds:
-        await redis_client.expire(key, expiry_seconds)
+    await _store_note(note_id, note.contents, note.meta, note.views, expiry_seconds)
 
     log.info("action=create note_id=%s ip=%s views=%s expiration=%s", note_id, ip, note.views, note.expiration)
     return {"id": note_id}
@@ -240,27 +251,18 @@ async def create_note(note: NoteCreate, request: Request):
 
 @app.post("/api/chunks")
 async def upload_chunk(chunk: ChunkUpload, request: Request):
-    """
-    Receive a single chunk of a large encrypted payload.
-    Chunks are stored in Redis under a temporary key scoped to the upload_id.
-    The client must call /api/chunks/complete once all chunks are uploaded.
-    """
     ip = get_client_ip(request)
 
-    # Reuse the create rate limit — each chunk counts as one request
     if not await check_rate_limit(ip, "create", RATE_LIMIT_CREATE):
         log.warning("action=rate_limit_chunk ip=%s", ip)
         raise HTTPException(status_code=429, detail="Too many requests — slow down")
 
-    # Validate chunk index
     if chunk.chunk_index < 0 or chunk.chunk_index >= chunk.total_chunks:
         raise HTTPException(status_code=400, detail="Invalid chunk_index")
 
-    # Validate upload_id is safe (alphanumeric + hyphens only)
     if not chunk.upload_id.replace("-", "").replace("_", "").isalnum():
         raise HTTPException(status_code=400, detail="Invalid upload_id")
 
-    # Size check on this individual chunk
     chunk_bytes = len(chunk.data.encode())
     if chunk_bytes > CHUNK_SIZE_LIMIT * 2:  # *2 because hex encoding doubles size
         raise HTTPException(status_code=413, detail="Chunk too large")
@@ -270,7 +272,6 @@ async def upload_chunk(chunk: ChunkUpload, request: Request):
 
     pipe = redis_client.pipeline()
     pipe.set(chunk_key, chunk.data, ex=CHUNK_TTL)
-    # Store total_chunks in a meta key so complete endpoint can verify
     pipe.set(meta_key, json.dumps({"total_chunks": chunk.total_chunks, "ip": ip}), ex=CHUNK_TTL)
     await pipe.execute()
 
@@ -283,17 +284,12 @@ async def upload_chunk(chunk: ChunkUpload, request: Request):
 
 @app.post("/api/chunks/complete", response_model=CreateResponse)
 async def complete_chunked_upload(body: ChunkComplete, request: Request):
-    """
-    Assemble all uploaded chunks, validate total size, then create the note.
-    Cleans up chunk keys from Redis after assembly.
-    """
     ip = get_client_ip(request)
 
     if not await check_rate_limit(ip, "create", RATE_LIMIT_CREATE):
         log.warning("action=rate_limit_complete ip=%s", ip)
         raise HTTPException(status_code=429, detail="Too many requests — slow down")
 
-    # Validate upload_id
     if not body.upload_id.replace("-", "").replace("_", "").isalnum():
         raise HTTPException(status_code=400, detail="Invalid upload_id")
 
@@ -305,7 +301,6 @@ async def complete_chunked_upload(body: ChunkComplete, request: Request):
     upload_meta = json.loads(meta_raw)
     total_chunks = upload_meta["total_chunks"]
 
-    # Fetch all chunks in order
     chunk_keys = [f"chunk:{body.upload_id}:{i}" for i in range(total_chunks)]
     chunk_values = await redis_client.mget(*chunk_keys)
 
@@ -313,7 +308,6 @@ async def complete_chunked_upload(body: ChunkComplete, request: Request):
     if missing:
         raise HTTPException(status_code=400, detail=f"Missing chunks: {missing}")
 
-    # Assemble
     contents = "".join(chunk_values)
 
     # Total size check (hex string length / 2 ≈ bytes)
@@ -321,14 +315,13 @@ async def complete_chunked_upload(body: ChunkComplete, request: Request):
     if approx_bytes > SIZE_LIMIT_BYTES:
         raise HTTPException(status_code=413, detail="Assembled payload too large")
 
-    # Clean up chunk keys (fire-and-forget — don't block the response)
+    # Clean up chunk keys
     pipe = redis_client.pipeline()
     for k in chunk_keys:
         pipe.delete(k)
     pipe.delete(meta_key)
     await pipe.execute()
 
-    # Validate expiry params
     if body.views is None and body.expiration is None:
         raise HTTPException(status_code=400, detail="At least views or expiration must be set")
 
@@ -347,17 +340,7 @@ async def complete_chunked_upload(body: ChunkComplete, request: Request):
         expiry_seconds = body.expiration * 60
 
     note_id = generate_id()
-    payload = {
-        "contents": contents,
-        "meta": body.meta,
-        "views": body.views,
-        "created": int(time.time()),
-    }
-
-    key = f"note:{note_id}"
-    await redis_client.set(key, json.dumps(payload))
-    if expiry_seconds:
-        await redis_client.expire(key, expiry_seconds)
+    await _store_note(note_id, contents, body.meta, body.views, expiry_seconds)
 
     log.info(
         "action=chunked_create note_id=%s ip=%s chunks=%d views=%s expiration=%s",
@@ -394,9 +377,11 @@ async def consume_note(note_id: str, request: Request):
         log.warning("action=rate_limit_read ip=%s", ip)
         raise HTTPException(status_code=429, detail="Too many requests — slow down")
 
-    key = f"note:{note_id}"
+    meta_key     = f"note:{note_id}"
+    contents_key = f"note:{note_id}:contents"
 
-    # Atomic read-decrement-or-delete using a Lua script.
+    # Atomic read-decrement-or-delete on the small metadata key only.
+    # The contents key is fetched separately — no cjson involved for large payloads.
     lua_script = """
 local key = KEYS[1]
 local raw = redis.call('GET', key)
@@ -415,15 +400,28 @@ if data.views then
 end
 return cjson.encode(data)
 """
-    result = await redis_client.eval(lua_script, 1, key)
+    result = await redis_client.eval(lua_script, 1, meta_key)
     if result is None:
         log.info("action=consume_not_found note_id=%s ip=%s", note_id, ip)
         raise HTTPException(status_code=404, detail="Note not found or already deleted")
 
-    data = json.loads(result)
-    remaining = data.get("views", "time-based")
+    meta_data = json.loads(result)
+    remaining  = meta_data.get("views", "time-based")
+
+    # Fetch contents separately (bypasses cjson entirely)
+    contents = await redis_client.get(contents_key)
+
+    # If the note was view-based and just got deleted, clean up the contents key too
+    if meta_data.get("views") == 0:
+        await redis_client.delete(contents_key)
+
+    if contents is None:
+        # Shouldn't happen in normal operation, but handle gracefully
+        log.warning("action=consume_missing_contents note_id=%s ip=%s", note_id, ip)
+        raise HTTPException(status_code=404, detail="Note not found or already deleted")
+
     log.info("action=consume note_id=%s ip=%s remaining_views=%s", note_id, ip, remaining)
-    return {"contents": data["contents"], "meta": data["meta"]}
+    return {"contents": contents, "meta": meta_data["meta"]}
 
 
 # ── Static frontend (catch-all, must be last) ─────────────────────────────────
