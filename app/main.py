@@ -40,6 +40,13 @@ THEME_FAVICON    = os.getenv("THEME_FAVICON", "https://www.emerald-group.co.uk/w
 IMPRINT_URL      = os.getenv("IMPRINT_URL", "")
 IMPRINT_HTML     = os.getenv("IMPRINT_HTML", "")
 
+# Chunked upload config
+# Each chunk must be ≤ CHUNK_SIZE_LIMIT bytes (default 90 MiB — safely under CF's 100 MiB body limit)
+CHUNK_SIZE_LIMIT = int(os.getenv("CHUNK_SIZE_LIMIT", str(90 * 1024 * 1024)))
+# Total assembled payload across all chunks still respects SIZE_LIMIT_BYTES
+# Partial chunks expire from Redis after CHUNK_TTL seconds if never completed
+CHUNK_TTL        = int(os.getenv("CHUNK_TTL", "3600"))  # 1 hour
+
 # Version: read from VERSION file baked in at build time, fall back to env, then default
 def _read_version() -> str:
     try:
@@ -95,10 +102,28 @@ class NoteInfo(BaseModel):
 class CreateResponse(BaseModel):
     id: str
 
+# ── Chunked upload models ─────────────────────────────────────────────────────
+class ChunkUpload(BaseModel):
+    upload_id: str   # client-generated session ID for this upload
+    chunk_index: int # 0-based
+    total_chunks: int
+    data: str        # hex-encoded chunk data
+
+class ChunkComplete(BaseModel):
+    upload_id: str
+    meta: str
+    views: Optional[int] = None
+    expiration: Optional[int] = None
+
+    @field_validator("meta")
+    @classmethod
+    def meta_size(cls, v: str) -> str:
+        if len(v.encode()) > META_LIMIT_BYTES:
+            raise ValueError(f"meta exceeds {META_LIMIT_BYTES} bytes")
+        return v
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def generate_id() -> str:
-    # token_urlsafe(n) produces ceil(n*4/3) URL-safe chars; request enough bytes
-    # so we always have at least ID_LENGTH characters, then trim.
     raw = secrets.token_urlsafe(ID_LENGTH)
     return raw[:ID_LENGTH]
 
@@ -144,6 +169,7 @@ async def get_status():
         "theme_text": THEME_TEXT,
         "theme_page_title": THEME_PAGE_TITLE,
         "theme_favicon": THEME_FAVICON,
+        "chunk_size": CHUNK_SIZE_LIMIT,
     }
 
 @app.get("/api/live")
@@ -174,7 +200,6 @@ async def create_note(note: NoteCreate, request: Request):
     # Size checks
     if len(note.contents.encode()) > SIZE_LIMIT_BYTES:
         raise HTTPException(status_code=413, detail="Note too large")
-    # meta size is enforced by the Pydantic validator above
 
     if note.views is None and note.expiration is None:
         raise HTTPException(status_code=400, detail="At least views or expiration must be set")
@@ -211,6 +236,136 @@ async def create_note(note: NoteCreate, request: Request):
     return {"id": note_id}
 
 
+# ── Chunked upload endpoints ───────────────────────────────────────────────────
+
+@app.post("/api/chunks")
+async def upload_chunk(chunk: ChunkUpload, request: Request):
+    """
+    Receive a single chunk of a large encrypted payload.
+    Chunks are stored in Redis under a temporary key scoped to the upload_id.
+    The client must call /api/chunks/complete once all chunks are uploaded.
+    """
+    ip = get_client_ip(request)
+
+    # Reuse the create rate limit — each chunk counts as one request
+    if not await check_rate_limit(ip, "create", RATE_LIMIT_CREATE):
+        log.warning("action=rate_limit_chunk ip=%s", ip)
+        raise HTTPException(status_code=429, detail="Too many requests — slow down")
+
+    # Validate chunk index
+    if chunk.chunk_index < 0 or chunk.chunk_index >= chunk.total_chunks:
+        raise HTTPException(status_code=400, detail="Invalid chunk_index")
+
+    # Validate upload_id is safe (alphanumeric + hyphens only)
+    if not chunk.upload_id.replace("-", "").replace("_", "").isalnum():
+        raise HTTPException(status_code=400, detail="Invalid upload_id")
+
+    # Size check on this individual chunk
+    chunk_bytes = len(chunk.data.encode())
+    if chunk_bytes > CHUNK_SIZE_LIMIT * 2:  # *2 because hex encoding doubles size
+        raise HTTPException(status_code=413, detail="Chunk too large")
+
+    chunk_key = f"chunk:{chunk.upload_id}:{chunk.chunk_index}"
+    meta_key  = f"chunk_meta:{chunk.upload_id}"
+
+    pipe = redis_client.pipeline()
+    pipe.set(chunk_key, chunk.data, ex=CHUNK_TTL)
+    # Store total_chunks in a meta key so complete endpoint can verify
+    pipe.set(meta_key, json.dumps({"total_chunks": chunk.total_chunks, "ip": ip}), ex=CHUNK_TTL)
+    await pipe.execute()
+
+    log.info(
+        "action=chunk_received upload_id=%s chunk=%d/%d ip=%s",
+        chunk.upload_id, chunk.chunk_index + 1, chunk.total_chunks, ip,
+    )
+    return {"ok": True, "chunk_index": chunk.chunk_index}
+
+
+@app.post("/api/chunks/complete", response_model=CreateResponse)
+async def complete_chunked_upload(body: ChunkComplete, request: Request):
+    """
+    Assemble all uploaded chunks, validate total size, then create the note.
+    Cleans up chunk keys from Redis after assembly.
+    """
+    ip = get_client_ip(request)
+
+    if not await check_rate_limit(ip, "create", RATE_LIMIT_CREATE):
+        log.warning("action=rate_limit_complete ip=%s", ip)
+        raise HTTPException(status_code=429, detail="Too many requests — slow down")
+
+    # Validate upload_id
+    if not body.upload_id.replace("-", "").replace("_", "").isalnum():
+        raise HTTPException(status_code=400, detail="Invalid upload_id")
+
+    meta_key = f"chunk_meta:{body.upload_id}"
+    meta_raw = await redis_client.get(meta_key)
+    if meta_raw is None:
+        raise HTTPException(status_code=404, detail="Upload session not found or expired")
+
+    upload_meta = json.loads(meta_raw)
+    total_chunks = upload_meta["total_chunks"]
+
+    # Fetch all chunks in order
+    chunk_keys = [f"chunk:{body.upload_id}:{i}" for i in range(total_chunks)]
+    chunk_values = await redis_client.mget(*chunk_keys)
+
+    missing = [i for i, v in enumerate(chunk_values) if v is None]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Missing chunks: {missing}")
+
+    # Assemble
+    contents = "".join(chunk_values)
+
+    # Total size check (hex string length / 2 ≈ bytes)
+    approx_bytes = len(contents) // 2
+    if approx_bytes > SIZE_LIMIT_BYTES:
+        raise HTTPException(status_code=413, detail="Assembled payload too large")
+
+    # Clean up chunk keys (fire-and-forget — don't block the response)
+    pipe = redis_client.pipeline()
+    for k in chunk_keys:
+        pipe.delete(k)
+    pipe.delete(meta_key)
+    await pipe.execute()
+
+    # Validate expiry params
+    if body.views is None and body.expiration is None:
+        raise HTTPException(status_code=400, detail="At least views or expiration must be set")
+
+    if not ALLOW_ADVANCED:
+        body.views = 1
+        body.expiration = None
+
+    expiry_seconds: Optional[int] = None
+    if body.views is not None:
+        if body.views < 1 or body.views > MAX_VIEWS:
+            raise HTTPException(status_code=400, detail=f"Views must be between 1 and {MAX_VIEWS}")
+        body.expiration = None
+    if body.expiration is not None:
+        if body.expiration < 1 or body.expiration > MAX_EXPIRATION:
+            raise HTTPException(status_code=400, detail=f"Expiration must be between 1 and {MAX_EXPIRATION} minutes")
+        expiry_seconds = body.expiration * 60
+
+    note_id = generate_id()
+    payload = {
+        "contents": contents,
+        "meta": body.meta,
+        "views": body.views,
+        "created": int(time.time()),
+    }
+
+    key = f"note:{note_id}"
+    await redis_client.set(key, json.dumps(payload))
+    if expiry_seconds:
+        await redis_client.expire(key, expiry_seconds)
+
+    log.info(
+        "action=chunked_create note_id=%s ip=%s chunks=%d views=%s expiration=%s",
+        note_id, ip, total_chunks, body.views, body.expiration,
+    )
+    return {"id": note_id}
+
+
 @app.get("/api/notes/{note_id}", response_model=NoteInfo)
 async def preview_note(note_id: str, request: Request):
     """Return note metadata without consuming a view."""
@@ -242,8 +397,6 @@ async def consume_note(note_id: str, request: Request):
     key = f"note:{note_id}"
 
     # Atomic read-decrement-or-delete using a Lua script.
-    # Uses KEEPTTL (Redis ≥ 6.0) so time-based expiry is preserved when
-    # decrementing a view-counted note that also has a TTL set.
     lua_script = """
 local key = KEYS[1]
 local raw = redis.call('GET', key)
@@ -257,7 +410,6 @@ if data.views then
     data.views = 0
   else
     data.views = data.views - 1
-    -- KEEPTTL preserves any existing TTL on the key (Redis >= 6.0)
     redis.call('SET', key, cjson.encode(data), 'KEEPTTL')
   end
 end
