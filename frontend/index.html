@@ -601,9 +601,6 @@ function generateUploadId(){
  * @returns {string} note ID
  */
 async function uploadPayload(hexPayload, metaJson, expiry, onProgress){
-  // Each hex char is 0.5 bytes; split at 2× binary chunk boundary
-  const chunkChars = CHUNK_SIZE_BYTES * 2
-
   // limitChars: threshold to enter chunked mode
   const limitChars = CHUNK_LIMIT_BYTES * 2
   // chunkChars: max hex chars per individual chunk POST
