@@ -579,10 +579,13 @@ async function apiDelete(path){
    After all chunks land, /api/chunks/complete assembles them server-side.
 ═══════════════════════════════════════════════════════════════════ */
 
-// Default chunk size: 45 MiB of binary → ~90 MiB hex string per request.
-// Overridden by the server's chunk_size field in /api/status if present.
-// We use half the binary chunk size because hex encoding doubles the size.
-let CHUNK_SIZE_BYTES = 45 * 1024 * 1024   // 45 MiB binary → ~90 MiB hex
+// Per-chunk size: each chunk POST body is CHUNK_SIZE_BYTES binary (~2x hex chars).
+// Overridden by server's chunk_size if provided.
+let CHUNK_SIZE_BYTES = 1 * 1024 * 1024    // 1 MiB binary → ~2 MiB hex per chunk
+// Files larger than CHUNK_LIMIT_BYTES always use the chunked path.
+// Keep this low so we never POST a huge JSON body in one shot —
+// large single POSTs fail silently through most proxies and Cloudflare.
+let CHUNK_LIMIT_BYTES = 1 * 1024 * 1024  // enter chunked mode above 1 MiB
 
 function generateUploadId(){
   return crypto.randomUUID ? crypto.randomUUID() : toHex(crypto.getRandomValues(new Uint8Array(16)))
@@ -601,35 +604,50 @@ async function uploadPayload(hexPayload, metaJson, expiry, onProgress){
   // Each hex char is 0.5 bytes; split at 2× binary chunk boundary
   const chunkChars = CHUNK_SIZE_BYTES * 2
 
-  if(hexPayload.length <= chunkChars){
-    // Small enough — single request via /api/notes
+  // limitChars: threshold to enter chunked mode
+  const limitChars = CHUNK_LIMIT_BYTES * 2
+  // chunkChars: max hex chars per individual chunk POST
+  const chunkChars = CHUNK_SIZE_BYTES * 2
+
+  if(hexPayload.length <= limitChars){
+    // Small note — single request via /api/notes
     const payload = { contents: hexPayload, meta: metaJson, ...expiry }
     onProgress && onProgress(1, 1)
     const resp = await apiPost('/api/notes', payload)
     return resp.id
   }
 
-  // Large payload — use chunked upload
+  // Large payload — chunked upload
   const uploadId = generateUploadId()
   const totalChunks = Math.ceil(hexPayload.length / chunkChars)
 
   for(let i = 0; i < totalChunks; i++){
     const slice = hexPayload.slice(i * chunkChars, (i + 1) * chunkChars)
-    await apiPost('/api/chunks', {
-      upload_id: uploadId,
-      chunk_index: i,
-      total_chunks: totalChunks,
-      data: slice,
-    })
+    // Retry up to 3x on rate-limit responses before giving up
+    let attempt = 0
+    while(true){
+      try{
+        await apiPost('/api/chunks', {
+          upload_id: uploadId,
+          chunk_index: i,
+          total_chunks: totalChunks,
+          data: slice,
+        })
+        break
+      } catch(e){
+        if(e.status === 429 && attempt < 3){
+          attempt++
+          await new Promise(r => setTimeout(r, 1200 * attempt))
+        } else {
+          throw e
+        }
+      }
+    }
     onProgress && onProgress(i + 1, totalChunks)
   }
 
   // Finalise
-  const completePayload = {
-    upload_id: uploadId,
-    meta: metaJson,
-    ...expiry,
-  }
+  const completePayload = { upload_id: uploadId, meta: metaJson, ...expiry }
   const resp = await apiPost('/api/chunks/complete', completePayload)
   return resp.id
 }
@@ -657,9 +675,9 @@ let _status = null
 async function boot(){
   try{
     _status = await apiGet('/api/status')
-    // Honour server-advertised chunk size if provided
+    // chunk_size = max binary bytes per chunk the server accepts.
+    // Update per-chunk size but leave CHUNK_LIMIT_BYTES at 1 MiB.
     if(_status?.chunk_size){
-      // chunk_size is max binary bytes per chunk; halve for hex
       CHUNK_SIZE_BYTES = Math.floor(_status.chunk_size / 2)
     }
   }catch{}
