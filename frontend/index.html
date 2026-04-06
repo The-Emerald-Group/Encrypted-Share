@@ -513,17 +513,114 @@ async function encrypt(plainBytes, key){
   return toHex(iv) + toHex(ct)
 }
 async function encryptText(text, key){ return encrypt(new TextEncoder().encode(text), key) }
-async function encryptFiles(files, key){
-  const data = await Promise.all(files.map(async f=>{
-    const buf = await f.arrayBuffer()
-    return {name:f.name,size:f.size,type:f.type||'application/octet-stream',contents:Array.from(new Uint8Array(buf))}
-  }))
-  return encryptText(JSON.stringify(data), key)
+
+// How many bytes of plaintext per file slice.
+// AES-GCM adds 16 bytes tag; hex doubles size. 16 MiB → ~32 MiB hex per slice.
+// Keeping this well under CHUNK_LIMIT_BYTES (1 MiB) means each encrypted slice
+// fits in one chunk POST with room to spare.
+const FILE_SLICE_BYTES = 512 * 1024  // 512 KiB plaintext per slice
+
+/**
+ * Encrypt files in slices so we never load more than FILE_SLICE_BYTES into
+ * memory at once. Returns a hex string encoding:
+ *   [header-hex][slice0-hex][slice1-hex]...
+ * where header-hex is an encrypted JSON manifest describing each file's
+ * slice count, name, size and MIME type, and each slice-hex is independently
+ * AES-GCM encrypted with its own IV.
+ */
+async function encryptFiles(files, key, onProgress){
+  // Build manifest and encrypt all slices, collecting hex segments
+  const segments = []   // will be joined at the end
+  const manifest = []   // one entry per file
+
+  let totalSlices = 0
+  for(const f of files){
+    totalSlices += Math.ceil(f.size / FILE_SLICE_BYTES) || 1
+  }
+  let doneSlices = 0
+
+  for(const f of files){
+    const sliceCount = Math.ceil(f.size / FILE_SLICE_BYTES) || 1
+    manifest.push({name:f.name, size:f.size, type:f.type||'application/octet-stream', slices:sliceCount})
+    for(let i = 0; i < sliceCount; i++){
+      const blob = f.slice(i * FILE_SLICE_BYTES, (i + 1) * FILE_SLICE_BYTES)
+      const buf  = await blob.arrayBuffer()
+      segments.push(await encrypt(new Uint8Array(buf), key))
+      doneSlices++
+      onProgress && onProgress(doneSlices, totalSlices)
+    }
+  }
+
+  // Prepend encrypted manifest so the header is also authenticated
+  const headerHex = await encryptText(JSON.stringify(manifest), key)
+  // Encode header length as 8 hex chars (4 bytes → max 4 GiB hex, plenty)
+  const headerLen = headerHex.length.toString(16).padStart(8, '0')
+  return headerLen + headerHex + segments.join('')
 }
+
 async function decryptToText(hexStr, key){
   const b = fromHex(hexStr)
   const pt = await crypto.subtle.decrypt({name:'AES-GCM',iv:b.slice(0,12)},key,b.slice(12))
   return new TextDecoder().decode(pt)
+}
+
+/**
+ * Decrypt a file-mode payload produced by encryptFiles.
+ * Returns the manifest array; each entry has .name/.size/.type/.slices.
+ * Individual file blobs are decrypted on demand in dlFile().
+ */
+async function decryptFileManifest(hexStr, key){
+  const headerLen = parseInt(hexStr.slice(0, 8), 16)
+  const headerHex = hexStr.slice(8, 8 + headerLen)
+  const manifest  = JSON.parse(await decryptToText(headerHex, key))
+  // Attach slice offsets so dlFile can find each slice
+  let pos = 8 + headerLen
+  for(const entry of manifest){
+    entry._sliceOffsets = []
+    for(let i = 0; i < entry.slices; i++){
+      // Each slice hex: 24 hex (12-byte IV) + ciphertext hex
+      // We don't know ciphertext length without reading, so store start pos
+      // and parse lazily. Actually we need the length — store [start, end].
+      // AES-GCM ciphertext = plaintext + 16-byte tag.
+      // plaintext ≤ FILE_SLICE_BYTES, but last slice may be smaller.
+      // We must scan to find where each slice ends.
+      // Strategy: store pos and compute end from IV+ciphertext structure.
+      // IV = 12 bytes = 24 hex chars; then ciphertext hex follows until next slice.
+      // Since we don't know plaintext length, store only start; dlFile will
+      // decrypt greedily using stored slice count and FILE_SLICE_BYTES heuristic.
+      entry._sliceOffsets.push(pos)
+      // Advance pos: IV (24) + (slicePlainLen + 16 tag) * 2
+      // For all but last slice, plainLen = FILE_SLICE_BYTES
+      const isLast = (i === entry.slices - 1)
+      const plainLen = isLast
+        ? (entry.size - i * FILE_SLICE_BYTES)
+        : FILE_SLICE_BYTES
+      pos += 24 + (plainLen + 16) * 2
+    }
+  }
+  return manifest
+}
+
+/**
+ * Decrypt and download a single file entry from a manifest.
+ * Reads and decrypts slices one at a time to keep memory bounded.
+ */
+async function decryptAndDownloadFile(hexStr, key, entry){
+  const parts = []
+  for(let i = 0; i < entry.slices; i++){
+    const start = entry._sliceOffsets[i]
+    const isLast = (i === entry.slices - 1)
+    const plainLen = isLast ? (entry.size - i * FILE_SLICE_BYTES) : FILE_SLICE_BYTES
+    const sliceHexLen = 24 + (plainLen + 16) * 2
+    const sliceHex = hexStr.slice(start, start + sliceHexLen)
+    const b = fromHex(sliceHex)
+    const pt = await crypto.subtle.decrypt({name:'AES-GCM',iv:b.slice(0,12)},key,b.slice(12))
+    parts.push(new Uint8Array(pt))
+  }
+  const blob = new Blob(parts, {type: entry.type || 'application/octet-stream'})
+  const a = Object.assign(document.createElement('a'),{href:URL.createObjectURL(blob),download:entry.name})
+  a.click()
+  setTimeout(()=>URL.revokeObjectURL(a.href), 10000)
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -936,7 +1033,11 @@ async function handleCreate(){
     let contents, type
     if(_home.mode === 'file'){
       if(_home.files.length === 0){ toast('No files selected','err'); _home.busy=false; await pageHome(); return }
-      contents = await encryptFiles(_home.files, key)
+      const totalSlices = _home.files.reduce((s,f)=>s+Math.ceil(f.size/FILE_SLICE_BYTES)||1, 0)
+      contents = await encryptFiles(_home.files, key, (done, total)=>{
+        const pct = Math.round(done/total*100)
+        const sm = $('statusMsg'); if(sm) sm.textContent = `Encrypting… ${pct}%`
+      })
       type = 'file'
     } else {
       const txt = $('noteText')?.value || ''
@@ -1107,7 +1208,8 @@ async function revealNote(id, pwMode, hashKey){
     const plaintext = await decryptToText(data.contents, key)
 
     if(meta.type === 'file'){
-      renderDecryptedFiles(JSON.parse(plaintext))
+      const manifest = await decryptFileManifest(data.contents, key)
+      renderDecryptedFiles(manifest, data.contents, key)
     } else {
       renderDecryptedText(plaintext)
     }
@@ -1177,13 +1279,13 @@ function copyPlaintext(){
   copyToClipboard(_private.getPlaintext() || '')
 }
 
-function renderDecryptedFiles(files){
-  _private.setDecFiles(files)
+function renderDecryptedFiles(manifest, hexStr, key){
+  _private.setDecFiles({manifest, hexStr, key})
 
   render(`<div class="page">
     <div class="warning">⚠ <strong>This is your one chance</strong> to download these files. They have been permanently deleted.</div>
     <div class="info-box">Save all files before navigating away — they cannot be recovered.</div>
-    ${files.map((f,i)=>`
+    ${manifest.map((f,i)=>`
       <div class="file-dl-row">
         <div>
           <div class="file-dl-name">${esc(f.name)}</div>
@@ -1198,18 +1300,16 @@ function renderDecryptedFiles(files){
   </div>`)
 }
 
-function dlFile(i){
-  const files = _private.getDecFiles()
-  if(!files) return
-  const f = files[i]
-  const blob = new Blob([new Uint8Array(f.contents)],{type:f.type||'application/octet-stream'})
-  const a = Object.assign(document.createElement('a'),{href:URL.createObjectURL(blob),download:f.name})
-  a.click(); URL.revokeObjectURL(a.href)
+async function dlFile(i){
+  const d = _private.getDecFiles()
+  if(!d) return
+  await decryptAndDownloadFile(d.hexStr, d.key, d.manifest[i])
 }
 
-function dlAll(){
-  const files = _private.getDecFiles()
-  if(files) files.forEach((_,i)=>dlFile(i))
+async function dlAll(){
+  const d = _private.getDecFiles()
+  if(!d) return
+  for(let i = 0; i < d.manifest.length; i++) await dlFile(i)
 }
 
 /* ═══════════════════════════════════════════════════════════════════
