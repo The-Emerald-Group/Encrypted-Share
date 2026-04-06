@@ -55,7 +55,6 @@ body{
   min-height:100dvh;
   line-height:1.6;
   -webkit-font-smoothing:antialiased;
-  /* subtle navy gradient */
   background-image: linear-gradient(160deg, #22242f 0%, #2a2d3a 60%, #22242f 100%);
 }
 
@@ -297,6 +296,32 @@ button{font-family:var(--mono);border-radius:var(--radius);cursor:pointer;transi
 .max-label{font-size:0.72rem;color:var(--t2)}
 .status-msg{font-size:0.78rem;color:var(--t2);margin-top:0.6rem;min-height:1.2rem}
 
+/* ── Upload progress bar ──────────────────────────────────────────── */
+.progress-wrap{
+  margin-top:0.8rem;
+  display:none;
+}
+.progress-wrap.visible{display:block}
+.progress-bar-bg{
+  height:6px;
+  background:var(--c3);
+  border-radius:3px;
+  overflow:hidden;
+}
+.progress-bar-fill{
+  height:100%;
+  background: linear-gradient(90deg, var(--forest), var(--lime));
+  border-radius:3px;
+  width:0%;
+  transition:width 0.3s var(--ease);
+}
+.progress-label{
+  font-size:0.7rem;
+  color:var(--t2);
+  margin-top:0.3rem;
+  text-align:right;
+}
+
 /* ── Note result display ──────────────────────────────────────────── */
 .note-box{
   background:rgba(42,45,58,0.8);
@@ -426,14 +451,12 @@ code{color:var(--lime)}
 ═══════════════════════════════════════════════════════════════════ */
 const $ = id => document.getElementById(id)
 
-// Safe escape for HTML attribute/text contexts
 function esc(s){
   return String(s)
     .replace(/&/g,'&amp;').replace(/</g,'&lt;')
     .replace(/>/g,'&gt;').replace(/"/g,'&quot;')
 }
 
-// Safe text node setter — never uses innerHTML with untrusted content
 function setText(el, text){ if(el) el.textContent = text }
 
 function render(content){
@@ -456,7 +479,7 @@ function toast(msg, type='ok'){
   const wrap = $('toasts')
   const el = document.createElement('div')
   el.className = `toast ${type}`
-  el.textContent = msg          // textContent — no XSS risk
+  el.textContent = msg
   wrap.appendChild(el)
   setTimeout(()=>{ el.style.transition='opacity 0.3s'; el.style.opacity='0'; setTimeout(()=>el.remove(),320) }, 3200)
 }
@@ -504,10 +527,9 @@ async function decryptToText(hexStr, key){
 }
 
 /* ═══════════════════════════════════════════════════════════════════
-   CLIPBOARD  (with fallback for non-HTTPS / permission-denied)
+   CLIPBOARD
 ═══════════════════════════════════════════════════════════════════ */
 async function copyToClipboard(text){
-  // Modern async API
   if(navigator.clipboard && window.isSecureContext){
     try{
       await navigator.clipboard.writeText(text)
@@ -515,7 +537,6 @@ async function copyToClipboard(text){
       return
     } catch(_){}
   }
-  // Fallback: create a temporary textarea and use execCommand
   try{
     const ta = document.createElement('textarea')
     ta.value = text
@@ -550,8 +571,71 @@ async function apiDelete(path){
 }
 
 /* ═══════════════════════════════════════════════════════════════════
-   PRIVATE STATE  (not on window — closure-scoped to avoid leaking
-   decrypted content to the global scope / browser console)
+   CHUNKED UPLOAD
+   
+   The encrypted payload (hex string) is split into CHUNK_CHARS-sized
+   pieces. Each piece is uploaded individually to /api/chunks, staying
+   well under Cloudflare's 100 MiB request body limit.
+   After all chunks land, /api/chunks/complete assembles them server-side.
+═══════════════════════════════════════════════════════════════════ */
+
+// Default chunk size: 45 MiB of binary → ~90 MiB hex string per request.
+// Overridden by the server's chunk_size field in /api/status if present.
+// We use half the binary chunk size because hex encoding doubles the size.
+let CHUNK_SIZE_BYTES = 45 * 1024 * 1024   // 45 MiB binary → ~90 MiB hex
+
+function generateUploadId(){
+  return crypto.randomUUID ? crypto.randomUUID() : toHex(crypto.getRandomValues(new Uint8Array(16)))
+}
+
+/**
+ * Upload a hex-encoded encrypted payload, splitting into chunks if needed.
+ *
+ * @param {string} hexPayload  - Full hex-encoded ciphertext
+ * @param {string} metaJson    - Serialised note meta
+ * @param {object} expiry      - { views } or { expiration }
+ * @param {function} onProgress - Called with (chunkIndex, totalChunks)
+ * @returns {string} note ID
+ */
+async function uploadPayload(hexPayload, metaJson, expiry, onProgress){
+  // Each hex char is 0.5 bytes; split at 2× binary chunk boundary
+  const chunkChars = CHUNK_SIZE_BYTES * 2
+
+  if(hexPayload.length <= chunkChars){
+    // Small enough — single request via /api/notes
+    const payload = { contents: hexPayload, meta: metaJson, ...expiry }
+    onProgress && onProgress(1, 1)
+    const resp = await apiPost('/api/notes', payload)
+    return resp.id
+  }
+
+  // Large payload — use chunked upload
+  const uploadId = generateUploadId()
+  const totalChunks = Math.ceil(hexPayload.length / chunkChars)
+
+  for(let i = 0; i < totalChunks; i++){
+    const slice = hexPayload.slice(i * chunkChars, (i + 1) * chunkChars)
+    await apiPost('/api/chunks', {
+      upload_id: uploadId,
+      chunk_index: i,
+      total_chunks: totalChunks,
+      data: slice,
+    })
+    onProgress && onProgress(i + 1, totalChunks)
+  }
+
+  // Finalise
+  const completePayload = {
+    upload_id: uploadId,
+    meta: metaJson,
+    ...expiry,
+  }
+  const resp = await apiPost('/api/chunks/complete', completePayload)
+  return resp.id
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   PRIVATE STATE
 ═══════════════════════════════════════════════════════════════════ */
 const _private = (() => {
   let _plaintext = null
@@ -571,7 +655,14 @@ const _private = (() => {
 let _status = null
 
 async function boot(){
-  try{ _status = await apiGet('/api/status') }catch{}
+  try{
+    _status = await apiGet('/api/status')
+    // Honour server-advertised chunk size if provided
+    if(_status?.chunk_size){
+      // chunk_size is max binary bytes per chunk; halve for hex
+      CHUNK_SIZE_BYTES = Math.floor(_status.chunk_size / 2)
+    }
+  }catch{}
   applyTheme(_status)
   const m = location.pathname.match(/^\/note\/([A-Za-z0-9_-]+)\/?$/)
   if(m) await pageNote(m[1])
@@ -586,20 +677,16 @@ function applyTheme(s){
     l.rel='icon'; l.href=esc(s.theme_favicon); document.head.appendChild(l)
   }
   if(s.theme_image){
-    // Build DOM node instead of innerHTML to avoid XSS via theme_image URL
     const a   = document.createElement('a'); a.href = '/'
     const img = document.createElement('img')
     img.className = 'logo-img'
-    img.src = s.theme_image   // browser sanitises this natively
+    img.src = s.theme_image
     img.alt = 'Logo'
     a.appendChild(img)
     $('logoArea').innerHTML = ''
     $('logoArea').appendChild(a)
   }
-  // theme_text is operator-controlled HTML — render it, but note in docs
-  // that operators must treat it as trusted input.
   if(s.theme_text){
-    // Intentionally rendered as HTML — operator-controlled only, not user data
     const introEl = document.getElementById('themeIntro')
     if(introEl) introEl.innerHTML = s.theme_text
   }
@@ -649,6 +736,14 @@ async function pageHome(){
       </button>
     </div>
 
+    <!-- Upload progress bar (hidden until chunked upload begins) -->
+    <div class="progress-wrap" id="progressWrap">
+      <div class="progress-bar-bg">
+        <div class="progress-bar-fill" id="progressFill"></div>
+      </div>
+      <div class="progress-label" id="progressLabel"></div>
+    </div>
+
     <p class="status-msg" id="statusMsg">${describeExpiry()}</p>
 
     ${allowAdv ? `
@@ -681,7 +776,6 @@ async function pageHome(){
     </p>
   </div>`)
 
-  // Apply theme_text after render so the element exists
   if(_status?.theme_text){
     const el = document.getElementById('themeIntro')
     if(el) el.innerHTML = _status.theme_text
@@ -779,6 +873,19 @@ function updateStatus(){
   const el = $('statusMsg'); if(el && !_home.busy) el.textContent = describeExpiry()
 }
 
+function setProgress(done, total){
+  const wrap  = $('progressWrap')
+  const fill  = $('progressFill')
+  const label = $('progressLabel')
+  if(!wrap) return
+  const pct = total > 0 ? Math.round((done / total) * 100) : 0
+  wrap.classList.add('visible')
+  if(fill)  fill.style.width = pct + '%'
+  if(label) label.textContent = total > 1
+    ? `Uploading chunk ${done} of ${total} (${pct}%)`
+    : `Uploading… ${pct}%`
+}
+
 function setBusy(msg){
   _home.busy = true
   const btn = $('submitBtn')
@@ -827,14 +934,21 @@ async function handleCreate(){
     if(derivation) meta.derivation = derivation
 
     const limitVal = parseInt($('limitVal')?.value||'1') || 1
-    const payload = {contents, meta: JSON.stringify(meta)}
-    if(_home.advanced && _home.timeMode) payload.expiration = limitVal
-    else payload.views = _home.advanced ? limitVal : 1
+    const expiry = {}
+    if(_home.advanced && _home.timeMode) expiry.expiration = limitVal
+    else expiry.views = _home.advanced ? limitVal : 1
 
     setBusy('Uploading')
-    const resp = await apiPost('/api/notes', payload)
+
+    const noteId = await uploadPayload(
+      contents,
+      JSON.stringify(meta),
+      expiry,
+      (done, total) => setProgress(done, total)
+    )
+
     const keyHex = pw ? null : await exportKeyHex(key)
-    const url = `${location.origin}/note/${resp.id}${keyHex?'#'+keyHex:''}`
+    const url = `${location.origin}/note/${noteId}${keyHex?'#'+keyHex:''}`
 
     toast('Note created successfully','ok')
     pageResult(url, pw)
@@ -920,7 +1034,6 @@ async function pageNote(id){
   }
 }
 
-// Store note meta in a module-scoped variable, not on window
 let _pendingNoteMeta = null
 
 function renderRevealButton(id, meta, hashKey){
@@ -997,25 +1110,21 @@ function renderDecryptedText(text){
   const urlRe = /[A-Za-z][A-Za-z0-9+\-.]*:\/\/[^\s<>"']+/g
   const links  = [...new Set(text.match(urlRe)||[])]
 
-  // Store in private closure, not on window
   _private.setPlaintext(text)
 
-  // Build the note box safely using a text node
   const noteBox = document.createElement('div')
   noteBox.className = 'note-box'
-  noteBox.textContent = text   // safe — no innerHTML
+  noteBox.textContent = text
 
   const container = document.createElement('div')
   container.className = 'page'
 
-  // Warning banner
   const warn = document.createElement('div')
   warn.className = 'warning'
   warn.innerHTML = '⚠ <strong>This is your one chance</strong> to read this note. It has been permanently deleted.'
   container.appendChild(warn)
   container.appendChild(noteBox)
 
-  // Action buttons row
   const btnRow = document.createElement('div')
   btnRow.style.cssText = 'display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:1rem'
   const copyBtn = document.createElement('button')
@@ -1029,7 +1138,6 @@ function renderDecryptedText(text){
   btnRow.appendChild(newBtn)
   container.appendChild(btnRow)
 
-  // Links found
   if(links.length){
     const linksBox = document.createElement('div')
     linksBox.className = 'links-box'
@@ -1041,7 +1149,7 @@ function renderDecryptedText(text){
       a.href = l
       a.target = '_blank'
       a.rel = 'noopener noreferrer'
-      a.textContent = l   // textContent — safe
+      a.textContent = l
       linksBox.appendChild(a)
     })
     container.appendChild(linksBox)
@@ -1055,7 +1163,6 @@ function copyPlaintext(){
 }
 
 function renderDecryptedFiles(files){
-  // Store in private closure, not on window
   _private.setDecFiles(files)
 
   render(`<div class="page">
