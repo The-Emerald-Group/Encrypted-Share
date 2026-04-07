@@ -528,35 +528,156 @@ const FILE_SLICE_BYTES = 512 * 1024  // 512 KiB plaintext per slice
  * slice count, name, size and MIME type, and each slice-hex is independently
  * AES-GCM encrypted with its own IV.
  */
-async function encryptFiles(files, key, onProgress){
-  // Build manifest and encrypt all slices, collecting hex segments
-  const segments = []   // will be joined at the end
-  const manifest = []   // one entry per file
 
-  let totalSlices = 0
-  for(const f of files){
-    totalSlices += Math.ceil(f.size / FILE_SLICE_BYTES) || 1
+/* ═══════════════════════════════════════════════════════════════════
+   STREAMING ENCRYPT + CHUNKED UPLOAD
+   
+   OLD pipeline:  encryptFiles() → giant hex string (peak ~6x fileSize RAM)
+                  → uploadPayload() slices it → chunks
+   
+   NEW pipeline:  pre-calculate totalChunks (AES-GCM output is deterministic)
+                  → for each 512KB slice: encrypt → append to rolling 2MB buffer
+                  → flush full chunks to server immediately → discard buffer
+   
+   Peak RAM: ~4 MB regardless of file size (was ~18 GB for a 3 GB file).
+   Server-assembled payload is byte-for-byte identical to the old format,
+   so decryptFileManifest / decryptAndDownloadFile are unchanged.
+═══════════════════════════════════════════════════════════════════ */
+
+/**
+ * Deterministically compute the total hex-string length that
+ * streamEncryptAndUpload will produce, given the files and a sample
+ * encrypted header length. Used to pre-calculate totalChunks so every
+ * chunk POST carries the correct total_chunks value.
+ *
+ * Formula per slice: IV(12B → 24 hex) + (plainLen + 16 tag) * 2 hex chars
+ */
+function calcTotalHexLen(files, headerHexLen) {
+  // 8-char length prefix + headerHexLen
+  let total = 8 + headerHexLen
+  for (const f of files) {
+    const slices = Math.ceil(f.size / FILE_SLICE_BYTES) || 1
+    for (let i = 0; i < slices; i++) {
+      const isLast   = i === slices - 1
+      const plainLen = isLast ? (f.size - i * FILE_SLICE_BYTES) : FILE_SLICE_BYTES
+      total += 24 + (plainLen + 16) * 2
+    }
   }
-  let doneSlices = 0
+  return total
+}
 
-  for(const f of files){
-    const sliceCount = Math.ceil(f.size / FILE_SLICE_BYTES) || 1
-    manifest.push({name:f.name, size:f.size, type:f.type||'application/octet-stream', slices:sliceCount})
-    for(let i = 0; i < sliceCount; i++){
-      const blob = f.slice(i * FILE_SLICE_BYTES, (i + 1) * FILE_SLICE_BYTES)
-      const buf  = await blob.arrayBuffer()
-      segments.push(await encrypt(new Uint8Array(buf), key))
-      doneSlices++
-      onProgress && onProgress(doneSlices, totalSlices)
+/**
+ * Streaming encrypt-and-upload for file notes.
+ * Encrypts each 512 KB slice and immediately pipelines it into the
+ * chunked uploader — never accumulates more than ~4 MB in JS heap.
+ *
+ * @param {File[]}    files         - Files to encrypt
+ * @param {CryptoKey} key           - AES-GCM-256 key
+ * @param {string}    metaJson      - Serialised note meta
+ * @param {object}    expiry        - { views } or { expiration }
+ * @param {function}  onEncProgress - (doneSlices, totalSlices)
+ * @param {function}  onUpProgress  - (doneChunks, totalChunks)
+ * @returns {Promise<string>} note ID
+ */
+async function streamEncryptAndUpload(files, key, metaJson, expiry, onEncProgress, onUpProgress) {
+  const chunkChars = CHUNK_SIZE_BYTES * 2  // hex chars per chunk POST
+
+  // ── 1. Build manifest and encrypt header ──────────────────────────
+  const manifest = files.map(f => ({
+    name:   f.name,
+    size:   f.size,
+    type:   f.type || 'application/octet-stream',
+    slices: Math.ceil(f.size / FILE_SLICE_BYTES) || 1,
+  }))
+
+  // Compute _sliceOffsets so decryptFileManifest() works identically.
+  // Offsets are absolute positions in the final assembled hex string.
+  const headerHex    = await encryptText(JSON.stringify(manifest), key)
+  const headerLenHex = headerHex.length.toString(16).padStart(8, '0')
+  const headerBlock  = headerLenHex + headerHex  // what sits at the very start
+
+  let offsetPos = headerBlock.length
+  for (const entry of manifest) {
+    entry._sliceOffsets = []
+    for (let i = 0; i < entry.slices; i++) {
+      entry._sliceOffsets.push(offsetPos)
+      const isLast   = i === entry.slices - 1
+      const plainLen = isLast ? (entry.size - i * FILE_SLICE_BYTES) : FILE_SLICE_BYTES
+      offsetPos += 24 + (plainLen + 16) * 2
     }
   }
 
-  // Prepend encrypted manifest so the header is also authenticated
-  const headerHex = await encryptText(JSON.stringify(manifest), key)
-  // Encode header length as 8 hex chars (4 bytes → max 4 GiB hex, plenty)
-  const headerLen = headerHex.length.toString(16).padStart(8, '0')
-  return headerLen + headerHex + segments.join('')
+  // ── 2. Pre-calculate totalChunks ──────────────────────────────────
+  const totalHexLen  = calcTotalHexLen(files, headerHex.length)
+  const totalChunks  = Math.ceil(totalHexLen / chunkChars)
+  const uploadId     = generateUploadId()
+  const totalSlices  = manifest.reduce((s, e) => s + e.slices, 0)
+
+  // ── 3. Stream: encrypt slice → fill buffer → flush chunks ─────────
+  let buffer      = headerBlock  // seed buffer with encrypted header
+  let chunkIndex  = 0
+  let doneSlices  = 0
+
+  async function flushChunk(hex) {
+    let attempt = 0
+    while (true) {
+      try {
+        await apiPost('/api/chunks', {
+          upload_id:    uploadId,
+          chunk_index:  chunkIndex,
+          total_chunks: totalChunks,
+          data:         hex,
+        })
+        chunkIndex++
+        onUpProgress && onUpProgress(chunkIndex, totalChunks)
+        return
+      } catch (e) {
+        if (e.status === 429 && attempt < 3) {
+          attempt++
+          await new Promise(r => setTimeout(r, 1200 * attempt))
+        } else {
+          throw e
+        }
+      }
+    }
+  }
+
+  for (const f of files) {
+    const slices = Math.ceil(f.size / FILE_SLICE_BYTES) || 1
+    for (let i = 0; i < slices; i++) {
+      const blob     = f.slice(i * FILE_SLICE_BYTES, (i + 1) * FILE_SLICE_BYTES)
+      const buf      = await blob.arrayBuffer()
+      const sliceHex = await encrypt(new Uint8Array(buf), key)
+
+      // Drain sliceHex into buffer, flushing complete chunks as we go
+      let writePos = 0
+      while (writePos < sliceHex.length) {
+        const space  = chunkChars - buffer.length
+        const take   = Math.min(space, sliceHex.length - writePos)
+        buffer      += sliceHex.slice(writePos, writePos + take)
+        writePos    += take
+        if (buffer.length >= chunkChars) {
+          await flushChunk(buffer)
+          buffer = ''
+        }
+      }
+      // sliceHex is now unreferenced and eligible for GC
+      doneSlices++
+      onEncProgress && onEncProgress(doneSlices, totalSlices)
+    }
+  }
+
+  // Flush any remaining tail
+  if (buffer.length > 0) {
+    await flushChunk(buffer)
+  }
+
+  // ── 4. Finalise ───────────────────────────────────────────────────
+  const completePayload = { upload_id: uploadId, meta: metaJson, ...expiry }
+  const resp = await apiPost('/api/chunks/complete', completePayload)
+  return resp.id
 }
+
 
 async function decryptToText(hexStr, key){
   const b = fromHex(hexStr)
@@ -578,16 +699,6 @@ async function decryptFileManifest(hexStr, key){
   for(const entry of manifest){
     entry._sliceOffsets = []
     for(let i = 0; i < entry.slices; i++){
-      // Each slice hex: 24 hex (12-byte IV) + ciphertext hex
-      // We don't know ciphertext length without reading, so store start pos
-      // and parse lazily. Actually we need the length — store [start, end].
-      // AES-GCM ciphertext = plaintext + 16-byte tag.
-      // plaintext ≤ FILE_SLICE_BYTES, but last slice may be smaller.
-      // We must scan to find where each slice ends.
-      // Strategy: store pos and compute end from IV+ciphertext structure.
-      // IV = 12 bytes = 24 hex chars; then ciphertext hex follows until next slice.
-      // Since we don't know plaintext length, store only start; dlFile will
-      // decrypt greedily using stored slice count and FILE_SLICE_BYTES heuristic.
       entry._sliceOffsets.push(pos)
       // Advance pos: IV (24) + (slicePlainLen + 16 tag) * 2
       // For all but last slice, plainLen = FILE_SLICE_BYTES
@@ -697,54 +808,6 @@ function generateUploadId(){
  * @param {function} onProgress - Called with (chunkIndex, totalChunks)
  * @returns {string} note ID
  */
-async function uploadPayload(hexPayload, metaJson, expiry, onProgress){
-  // limitChars: threshold to enter chunked mode
-  const limitChars = CHUNK_LIMIT_BYTES * 2
-  // chunkChars: max hex chars per individual chunk POST
-  const chunkChars = CHUNK_SIZE_BYTES * 2
-
-  if(hexPayload.length <= limitChars){
-    // Small note — single request via /api/notes
-    const payload = { contents: hexPayload, meta: metaJson, ...expiry }
-    onProgress && onProgress(1, 1)
-    const resp = await apiPost('/api/notes', payload)
-    return resp.id
-  }
-
-  // Large payload — chunked upload
-  const uploadId = generateUploadId()
-  const totalChunks = Math.ceil(hexPayload.length / chunkChars)
-
-  for(let i = 0; i < totalChunks; i++){
-    const slice = hexPayload.slice(i * chunkChars, (i + 1) * chunkChars)
-    // Retry up to 3x on rate-limit responses before giving up
-    let attempt = 0
-    while(true){
-      try{
-        await apiPost('/api/chunks', {
-          upload_id: uploadId,
-          chunk_index: i,
-          total_chunks: totalChunks,
-          data: slice,
-        })
-        break
-      } catch(e){
-        if(e.status === 429 && attempt < 3){
-          attempt++
-          await new Promise(r => setTimeout(r, 1200 * attempt))
-        } else {
-          throw e
-        }
-      }
-    }
-    onProgress && onProgress(i + 1, totalChunks)
-  }
-
-  // Finalise
-  const completePayload = { upload_id: uploadId, meta: metaJson, ...expiry }
-  const resp = await apiPost('/api/chunks/complete', completePayload)
-  return resp.id
-}
 
 /* ═══════════════════════════════════════════════════════════════════
    PRIVATE STATE
@@ -1034,10 +1097,8 @@ async function handleCreate(){
     if(_home.mode === 'file'){
       if(_home.files.length === 0){ toast('No files selected','err'); _home.busy=false; await pageHome(); return }
       const totalSlices = _home.files.reduce((s,f)=>s+Math.ceil(f.size/FILE_SLICE_BYTES)||1, 0)
-      contents = await encryptFiles(_home.files, key, (done, total)=>{
-        const pct = Math.round(done/total*100)
-        const sm = $('statusMsg'); if(sm) sm.textContent = `Encrypting… ${pct}%`
-      })
+      // streamEncryptAndUpload handles encrypt+upload in one streaming pass.
+      // We set type early so meta is correct; actual upload happens below.
       type = 'file'
     } else {
       const txt = $('noteText')?.value || ''
@@ -1056,12 +1117,29 @@ async function handleCreate(){
 
     setBusy('Uploading')
 
-    const noteId = await uploadPayload(
-      contents,
-      JSON.stringify(meta),
-      expiry,
-      (done, total) => setProgress(done, total)
-    )
+    let noteId
+    if(_home.mode === 'file'){
+      // Streaming path: never builds a giant hex string in memory
+      noteId = await streamEncryptAndUpload(
+        _home.files,
+        key,
+        JSON.stringify(meta),
+        expiry,
+        (doneSlices, totalSlices) => {
+          const pct = Math.round(doneSlices / totalSlices * 100)
+          const sm = $('statusMsg'); if(sm) sm.textContent = `Encrypting… ${pct}%`
+        },
+        (doneChunks, totalChunks) => setProgress(doneChunks, totalChunks)
+      )
+    } else {
+      // Text path: small payload, single request or regular chunked upload
+      noteId = await uploadPayload(
+        contents,
+        JSON.stringify(meta),
+        expiry,
+        (done, total) => setProgress(done, total)
+      )
+    }
 
     const keyHex = pw ? null : await exportKeyHex(key)
     const url = `${location.origin}/note/${noteId}${keyHex?'#'+keyHex:''}`
