@@ -64,7 +64,13 @@ redis_client: aioredis.Redis = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global redis_client
-    redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
+    redis_client = aioredis.from_url(
+        REDIS_URL,
+        decode_responses=True,
+        socket_timeout=30,
+        socket_connect_timeout=10,
+        retry_on_timeout=True,
+    )
     try:
         await redis_client.ping()
         log.info("Connected to Redis at %s", REDIS_URL)
@@ -306,8 +312,23 @@ async def complete_chunked_upload(body: ChunkComplete, request: Request):
     upload_meta = json.loads(meta_raw)
     total_chunks = upload_meta["total_chunks"]
 
-    chunk_keys = [f"chunk:{body.upload_id}:{i}" for i in range(total_chunks)]
-    chunk_values = await redis_client.mget(*chunk_keys)
+    # FIX: Fetch chunks individually via pipeline instead of a single mget
+    # with many keys. A single mget over 79 keys returning ~2 MB each
+    # (~158 MB total) exceeds Redis's output-buffer limit and causes the
+    # server to close the connection mid-reply.  Pipelining GET commands
+    # in batches of 10 keeps each round-trip small and well within limits.
+    BATCH_SIZE = 10
+    chunk_values = []
+    for batch_start in range(0, total_chunks, BATCH_SIZE):
+        batch_keys = [
+            f"chunk:{body.upload_id}:{i}"
+            for i in range(batch_start, min(batch_start + BATCH_SIZE, total_chunks))
+        ]
+        pipe = redis_client.pipeline()
+        for k in batch_keys:
+            pipe.get(k)
+        results = await pipe.execute()
+        chunk_values.extend(results)
 
     missing = [i for i, v in enumerate(chunk_values) if v is None]
     if missing:
@@ -322,8 +343,8 @@ async def complete_chunked_upload(body: ChunkComplete, request: Request):
 
     # Clean up chunk keys
     pipe = redis_client.pipeline()
-    for k in chunk_keys:
-        pipe.delete(k)
+    for i in range(total_chunks):
+        pipe.delete(f"chunk:{body.upload_id}:{i}")
     pipe.delete(meta_key)
     await pipe.execute()
 
