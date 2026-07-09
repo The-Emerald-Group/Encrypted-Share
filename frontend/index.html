@@ -497,6 +497,18 @@ async function exportKeyHex(k){ return toHex(await crypto.subtle.exportKey('raw'
 async function importKeyHex(hex, usage=['decrypt']){
   return crypto.subtle.importKey('raw',fromHex(hex),{name:'AES-GCM'},false,usage)
 }
+// Tolerant cleanup for manually-pasted keys: strips whitespace/newlines that
+// email clients often insert when wrapping long lines, and pulls the hex key
+// out if the user pasted a whole (possibly filter-mangled) URL instead of
+// just the fragment.
+function normalizeKeyInput(raw){
+  if(!raw) return null
+  let s = String(raw).replace(/\s+/g,'')
+  const hashIdx = s.indexOf('#')
+  if(hashIdx !== -1) s = s.slice(hashIdx+1)
+  s = s.toLowerCase()
+  return /^[0-9a-f]{64}$/.test(s) ? s : null
+}
 async function deriveKey(password, saltHex){
   const enc = new TextEncoder()
   const salt = saltHex ? fromHex(saltHex) : crypto.getRandomValues(new Uint8Array(16))
@@ -1161,7 +1173,7 @@ async function handleCreate(){
     const url = `${location.origin}/note/${noteId}${keyHex?'#'+keyHex:''}`
 
     toast('Note created successfully','ok')
-    pageResult(url, pw)
+    pageResult(url, pw, keyHex)
   } catch(err){
     if(err.status===413) toast('Note is too large','err')
     else if(err.status===429) toast('Too many requests — please wait a moment','err')
@@ -1172,7 +1184,7 @@ async function handleCreate(){
   }
 }
 
-function pageResult(url, hasCustomPw){
+function pageResult(url, hasCustomPw, keyHex){
   const mailto = `mailto:?subject=${encodeURIComponent('Shared secure note')}&body=${encodeURIComponent(url)}`
   render(`<div class="page">
     <div class="result-card">
@@ -1185,6 +1197,20 @@ function pageResult(url, hasCustomPw){
         </div>
       </div>
       ${hasCustomPw ? `<p class="hint" style="margin-top:0.5rem">⚠ Password is required to open this note — share it separately.</p>` : ''}
+      ${keyHex ? `
+      <div class="warning" style="margin-top:0.8rem">
+        <strong>Sending this by email?</strong> Some corporate spam/security filters rewrite links and
+        drop everything after <code>#</code>, which strips the decryption key from the link. If the
+        recipient reports "decryption key missing", have them open the link and paste the key below manually,
+        or send the key to them separately (chat, SMS) as a backup.
+      </div>
+      <div class="field" style="margin-top:0.6rem">
+        <span class="label">Decryption key (backup — send separately if needed)</span>
+        <div class="input-row">
+          <input type="text" id="shareKey" readonly value="${esc(keyHex)}"/>
+          <button class="btn-icon" onclick="copyShareKey()">Copy</button>
+        </div>
+      </div>` : ''}
       <div class="info-box" style="margin-top:0.8rem">
         ⚠ The link contains the decryption key. Anyone with the link can read the note — treat it like a password.
       </div>
@@ -1201,6 +1227,11 @@ function pageResult(url, hasCustomPw){
 function copyShareUrl(){
   const url = $('shareUrl')?.value || ''
   copyToClipboard(url)
+}
+
+function copyShareKey(){
+  const key = $('shareKey')?.value || ''
+  copyToClipboard(key)
 }
 
 function startOver(){
@@ -1237,11 +1268,27 @@ async function pageNote(id){
   } else if(hashKey){
     renderRevealButton(id, meta, hashKey)
   } else {
-    render(`<div class="page">
-      <p style="color:var(--red);margin-bottom:1rem">Decryption key missing — the link may be incomplete.</p>
-      <a href="/"><button class="btn-ghost">← Create a new note</button></a>
-    </div>`)
+    renderManualKeyPrompt(id, meta)
   }
+}
+
+function renderManualKeyPrompt(id, meta){
+  _pendingNoteMeta = meta
+  render(`<div class="page pw-card">
+    <p style="color:var(--red);margin-bottom:0.5rem">Decryption key missing from the link.</p>
+    <p class="hint" style="margin-bottom:1rem">
+      This usually happens when an email or chat spam filter rewrites the link and strips
+      everything after <code>#</code>. Ask the sender for the decryption key
+      (they can copy it separately) and paste it below.
+    </p>
+    <div class="field">
+      <span class="label">Decryption key</span>
+      <input type="text" id="manualKeyInput" placeholder="Paste decryption key…" autocapitalize="off" autocorrect="off" spellcheck="false"
+        onkeydown="if(event.key==='Enter') revealNote('${esc(id)}',null,$('manualKeyInput')?.value.trim())"/>
+    </div>
+    <button class="btn-primary" id="revealBtn" onclick="revealNote('${esc(id)}',null,$('manualKeyInput')?.value.trim())">Reveal note</button>
+    <p id="revealErr" class="error" style="display:none"></p>
+  </div>`)
 }
 
 let _pendingNoteMeta = null
@@ -1296,7 +1343,13 @@ async function revealNote(id, pwMode, hashKey){
       const d = await deriveKey(pw, meta.derivation)
       key = d.key
     } else {
-      key = await importKeyHex(hashKey)
+      const cleanKey = normalizeKeyInput(hashKey)
+      if(!cleanKey){
+        if(errEl){ errEl.textContent='That doesn\'t look like a valid decryption key.'; errEl.style.display='block' }
+        if(btn){ btn.disabled=false; btn.textContent='Try again' }
+        return
+      }
+      key = await importKeyHex(cleanKey)
     }
 
     const plaintext = await decryptToText(data.contents, key)
