@@ -760,11 +760,6 @@ async function apiPost(path, body){
   if(!r.ok) throw Object.assign(new Error('api'),{status:r.status})
   return r.json()
 }
-async function apiDelete(path){
-  const r = await fetch(path,{method:'DELETE'})
-  if(!r.ok) throw Object.assign(new Error('api'),{status:r.status})
-  return r.json()
-}
 
 /* ═══════════════════════════════════════════════════════════════════
    CHUNKED UPLOAD
@@ -1249,9 +1244,11 @@ async function pageNote(id){
   render(`<div style="color:var(--t2);font-size:0.82rem;padding-top:1rem">Checking…<span class="spinner"></span></div>`)
 
   let meta
+  let revealToken
   try{
     const info = await apiGet(`/api/notes/${id}`)
     meta = JSON.parse(info.meta || '{}')
+    revealToken = info.reveal_token
   } catch(e){
     const msg = e.status === 429
       ? 'Too many requests — please wait a moment and try again.'
@@ -1264,16 +1261,17 @@ async function pageNote(id){
   }
 
   if(meta.derivation){
-    renderPasswordPrompt(id, meta)
+    renderPasswordPrompt(id, meta, revealToken)
   } else if(hashKey){
-    renderRevealButton(id, meta, hashKey)
+    renderRevealButton(id, meta, hashKey, revealToken)
   } else {
-    renderManualKeyPrompt(id, meta)
+    renderManualKeyPrompt(id, meta, revealToken)
   }
 }
 
-function renderManualKeyPrompt(id, meta){
+function renderManualKeyPrompt(id, meta, revealToken){
   _pendingNoteMeta = meta
+  _revealToken = revealToken
   render(`<div class="page pw-card">
     <p style="color:var(--red);margin-bottom:0.5rem">Decryption key missing from the link.</p>
     <p class="hint" style="margin-bottom:1rem">
@@ -1292,9 +1290,11 @@ function renderManualKeyPrompt(id, meta){
 }
 
 let _pendingNoteMeta = null
+let _revealToken = null
 
-function renderRevealButton(id, meta, hashKey){
+function renderRevealButton(id, meta, hashKey, revealToken){
   _pendingNoteMeta = meta
+  _revealToken = revealToken
   const isFile = meta.type === 'file'
   render(`<div class="page">
     <p style="font-size:0.82rem;color:var(--t1);margin-bottom:1.5rem">
@@ -1310,8 +1310,9 @@ function renderRevealButton(id, meta, hashKey){
   </div>`)
 }
 
-function renderPasswordPrompt(id, meta){
+function renderPasswordPrompt(id, meta, revealToken){
   _pendingNoteMeta = meta
+  _revealToken = revealToken
   render(`<div class="page pw-card">
     <p>This note is protected with a custom password.<br/>Enter it below to decrypt and reveal the note.</p>
     <div class="field">
@@ -1333,7 +1334,9 @@ async function revealNote(id, pwMode, hashKey){
   if(errEl) errEl.style.display='none'
 
   try{
-    const data = await apiDelete(`/api/notes/${id}`)
+    if(!_revealToken) throw Object.assign(new Error('no token'), {status: 403})
+    const data = await apiPost(`/api/notes/${id}/reveal`, { token: _revealToken })
+    _revealToken = null
     const meta = _pendingNoteMeta || {}
     let key
 
@@ -1364,6 +1367,7 @@ async function revealNote(id, pwMode, hashKey){
     let msg
     if(e.status === 404)      msg = 'Note not found — it may have already been viewed.'
     else if(e.status === 429) msg = 'Too many requests — please wait a moment.'
+    else if(e.status === 403) msg = 'Session expired — please refresh the page and try again.'
     else                      msg = 'Decryption failed. Wrong password or broken link.'
     if(errEl){ errEl.textContent=msg; errEl.style.display='block' }
     if(btn){ btn.disabled=false; btn.textContent='Try again' }

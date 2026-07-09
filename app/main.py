@@ -37,6 +37,7 @@ RATE_LIMIT_READ   = int(os.getenv("RATE_LIMIT_READ",   "60"))    # per minute pe
 # note-creation limit. Default 600 = 10 chunks/sec sustained, well above any
 # realistic upload speed while still blocking abuse.
 RATE_LIMIT_CHUNK  = int(os.getenv("RATE_LIMIT_CHUNK",  "600"))   # per minute per IP
+REVEAL_TOKEN_TTL  = int(os.getenv("REVEAL_TOKEN_TTL",  "300"))   # seconds (preview → reveal window)
 THEME_IMAGE      = os.getenv("THEME_IMAGE", "https://emerald-group.co.uk/wp-content/uploads/2022/10/Emeralds-Group-Logo-Lighter-text.svg")
 THEME_TEXT       = os.getenv("THEME_TEXT", "")
 THEME_PAGE_TITLE = os.getenv("THEME_PAGE_TITLE", "Emerald Password Share")
@@ -104,6 +105,10 @@ class NotePublic(BaseModel):
 
 class NoteInfo(BaseModel):
     meta: str
+    reveal_token: str
+
+class RevealRequest(BaseModel):
+    token: str
 
 class CreateResponse(BaseModel):
     id: str
@@ -140,6 +145,21 @@ def get_client_ip(request: Request) -> str:
     if request.client:
         return request.client.host
     return "unknown"
+
+# Substrings matched case-insensitively against User-Agent on reveal (not preview).
+_SCANNER_UA_MARKERS = (
+    "proofpoint", "urldefense", "mimecast", "barracuda", "safelinks",
+    "clickprotect", "fireeye", "messagelabs", "symantec", "forcepoint",
+    "ironport", "atp/", "emailsecurity", "linkprotect", "zscaler",
+    "headlesschrome", "phantomjs", "python-requests", "curl/", "wget/",
+    "go-http-client", "java/", "libwww-perl", "scrapy",
+)
+
+def is_scanner_user_agent(request: Request) -> bool:
+    ua = (request.headers.get("user-agent") or "").lower()
+    if not ua:
+        return True
+    return any(marker in ua for marker in _SCANNER_UA_MARKERS)
 
 async def check_rate_limit(ip: str, action: str, limit: int) -> bool:
     now = time.time()
@@ -375,40 +395,7 @@ async def complete_chunked_upload(body: ChunkComplete, request: Request):
     return {"id": note_id}
 
 
-@app.get("/api/notes/{note_id}", response_model=NoteInfo)
-async def preview_note(note_id: str, request: Request):
-    """Return note metadata without consuming a view."""
-    ip = get_client_ip(request)
-
-    if not await check_rate_limit(ip, "read", RATE_LIMIT_READ):
-        log.warning("action=rate_limit_read ip=%s", ip)
-        raise HTTPException(status_code=429, detail="Too many requests — slow down")
-
-    key = f"note:{note_id}"
-    raw = await redis_client.get(key)
-    if raw is None:
-        log.info("action=preview_not_found note_id=%s ip=%s", note_id, ip)
-        raise HTTPException(status_code=404, detail="Note not found")
-    data = json.loads(raw)
-    log.info("action=preview note_id=%s ip=%s", note_id, ip)
-    return {"meta": data["meta"]}
-
-
-@app.delete("/api/notes/{note_id}", response_model=NotePublic)
-async def consume_note(note_id: str, request: Request):
-    """Consume (read + maybe destroy) a note."""
-    ip = get_client_ip(request)
-
-    if not await check_rate_limit(ip, "read", RATE_LIMIT_READ):
-        log.warning("action=rate_limit_read ip=%s", ip)
-        raise HTTPException(status_code=429, detail="Too many requests — slow down")
-
-    meta_key     = f"note:{note_id}"
-    contents_key = f"note:{note_id}:contents"
-
-    # Atomic read-decrement-or-delete on the small metadata key only.
-    # The contents key is fetched separately — no cjson involved for large payloads.
-    lua_script = """
+_CONSUME_LUA = """
 local key = KEYS[1]
 local raw = redis.call('GET', key)
 if not raw then
@@ -426,28 +413,89 @@ if data.views then
 end
 return cjson.encode(data)
 """
-    result = await redis_client.eval(lua_script, 1, meta_key)
+
+
+async def _consume_note(note_id: str, ip: str) -> NotePublic:
+    """Atomically read and optionally destroy a note."""
+    meta_key     = f"note:{note_id}"
+    contents_key = f"note:{note_id}:contents"
+
+    result = await redis_client.eval(_CONSUME_LUA, 1, meta_key)
     if result is None:
         log.info("action=consume_not_found note_id=%s ip=%s", note_id, ip)
         raise HTTPException(status_code=404, detail="Note not found or already deleted")
 
     meta_data = json.loads(result)
-    remaining  = meta_data.get("views", "time-based")
+    remaining = meta_data.get("views", "time-based")
 
-    # Fetch contents separately (bypasses cjson entirely)
     contents = await redis_client.get(contents_key)
 
-    # If the note was view-based and just got deleted, clean up the contents key too
     if meta_data.get("views") == 0:
         await redis_client.delete(contents_key)
 
     if contents is None:
-        # Shouldn't happen in normal operation, but handle gracefully
         log.warning("action=consume_missing_contents note_id=%s ip=%s", note_id, ip)
         raise HTTPException(status_code=404, detail="Note not found or already deleted")
 
     log.info("action=consume note_id=%s ip=%s remaining_views=%s", note_id, ip, remaining)
     return {"contents": contents, "meta": meta_data["meta"]}
+
+
+@app.get("/api/notes/{note_id}", response_model=NoteInfo)
+async def preview_note(note_id: str, request: Request):
+    """Return note metadata and a short-lived reveal token (does not consume a view)."""
+    ip = get_client_ip(request)
+
+    if not await check_rate_limit(ip, "read", RATE_LIMIT_READ):
+        log.warning("action=rate_limit_read ip=%s", ip)
+        raise HTTPException(status_code=429, detail="Too many requests — slow down")
+
+    key = f"note:{note_id}"
+    raw = await redis_client.get(key)
+    if raw is None:
+        log.info("action=preview_not_found note_id=%s ip=%s", note_id, ip)
+        raise HTTPException(status_code=404, detail="Note not found")
+    data = json.loads(raw)
+
+    reveal_token = secrets.token_urlsafe(32)
+    await redis_client.set(f"reveal:{reveal_token}", note_id, ex=REVEAL_TOKEN_TTL)
+
+    log.info("action=preview note_id=%s ip=%s", note_id, ip)
+    return {"meta": data["meta"], "reveal_token": reveal_token}
+
+
+@app.post("/api/notes/{note_id}/reveal", response_model=NotePublic)
+async def reveal_note(note_id: str, body: RevealRequest, request: Request):
+    """Consume a note — requires a one-time token issued by the preview endpoint."""
+    ip = get_client_ip(request)
+
+    if is_scanner_user_agent(request):
+        ua = request.headers.get("user-agent", "")
+        log.warning("action=reveal_blocked_scanner note_id=%s ip=%s ua=%s", note_id, ip, ua[:120])
+        raise HTTPException(status_code=403, detail="Reveal not permitted")
+
+    if not await check_rate_limit(ip, "read", RATE_LIMIT_READ):
+        log.warning("action=rate_limit_read ip=%s", ip)
+        raise HTTPException(status_code=429, detail="Too many requests — slow down")
+
+    token_key = f"reveal:{body.token}"
+    stored_id = await redis_client.getdel(token_key)
+    if stored_id != note_id:
+        log.warning("action=reveal_invalid_token note_id=%s ip=%s", note_id, ip)
+        raise HTTPException(status_code=403, detail="Invalid or expired reveal token")
+
+    return await _consume_note(note_id, ip)
+
+
+@app.delete("/api/notes/{note_id}")
+async def consume_note_deprecated(note_id: str, request: Request):
+    """Deprecated — scanners used to burn notes via bare DELETE. Use POST /reveal instead."""
+    ip = get_client_ip(request)
+    log.warning("action=consume_blocked_delete note_id=%s ip=%s", note_id, ip)
+    raise HTTPException(
+        status_code=403,
+        detail="Direct delete is disabled — open this link in a browser and click Reveal",
+    )
 
 
 # ── Static frontend (catch-all, must be last) ─────────────────────────────────
