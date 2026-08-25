@@ -1,6 +1,7 @@
 import json
 import os
 import secrets
+import string
 import time
 import logging
 from contextlib import asynccontextmanager
@@ -30,7 +31,7 @@ MAX_VIEWS        = int(os.getenv("MAX_VIEWS", "100"))
 MAX_EXPIRATION   = int(os.getenv("MAX_EXPIRATION", "360"))  # minutes
 ALLOW_ADVANCED   = os.getenv("ALLOW_ADVANCED", "true").lower() == "true"
 ALLOW_FILES      = os.getenv("ALLOW_FILES", "true").lower() == "true"
-ID_LENGTH        = int(os.getenv("ID_LENGTH", "32"))
+ID_LENGTH        = int(os.getenv("ID_LENGTH", "12"))
 RATE_LIMIT_CREATE = int(os.getenv("RATE_LIMIT_CREATE", "20"))    # per minute per IP
 RATE_LIMIT_READ   = int(os.getenv("RATE_LIMIT_READ",   "60"))    # per minute per IP
 # Chunks get their own generous bucket so multi-chunk uploads don't exhaust the
@@ -134,9 +135,16 @@ class ChunkComplete(BaseModel):
         return v
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+# Alphanumeric only (no '-' or '_'). Two reasons: it keeps generated links a
+# few characters shorter than base64url, and it avoids the character most
+# often mangled by markdown-aware mail/chat clients and corporate email
+# security gateways, which sometimes rewrite an underscore as "\_" (or drop
+# it) when relaying a link. That corruption breaks the frontend's route
+# match and used to silently dump the recipient on the home page.
+_ID_ALPHABET = string.ascii_letters + string.digits
+
 def generate_id() -> str:
-    raw = secrets.token_urlsafe(ID_LENGTH)
-    return raw[:ID_LENGTH]
+    return "".join(secrets.choice(_ID_ALPHABET) for _ in range(ID_LENGTH))
 
 def get_client_ip(request: Request) -> str:
     cf_ip = request.headers.get("CF-Connecting-IP")
