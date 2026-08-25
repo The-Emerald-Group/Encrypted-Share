@@ -490,15 +490,34 @@ function toast(msg, type='ok'){
 const toHex = buf => Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('')
 const fromHex = str => new Uint8Array((str.match(/.{2}/g)||[]).map(h=>parseInt(h,16)))
 
+// Compact URL-safe key encoding used in share links (shorter than hex, and
+// deliberately avoids '_' — the character most often mangled by
+// markdown-aware mail/chat clients and corporate email security gateways.
+// Alphabet: A-Za-z0-9, '-' in place of '+', '~' in place of '/', no padding.
+// A 256-bit AES key encodes to 43 characters this way, vs 64 for hex.
+function toB64Url(buf){
+  let bin = ''
+  new Uint8Array(buf).forEach(b => bin += String.fromCharCode(b))
+  return btoa(bin).replace(/\+/g,'-').replace(/\//g,'~').replace(/=+$/,'')
+}
+function fromB64Url(str){
+  let s = String(str).replace(/-/g,'+').replace(/~/g,'/')
+  while(s.length % 4) s += '='
+  const bin = atob(s)
+  const arr = new Uint8Array(bin.length)
+  for(let i=0;i<bin.length;i++) arr[i] = bin.charCodeAt(i)
+  return arr
+}
+
 async function genKey(){
   return crypto.subtle.generateKey({name:'AES-GCM',length:256},true,['encrypt','decrypt'])
 }
-async function exportKeyHex(k){ return toHex(await crypto.subtle.exportKey('raw',k)) }
-async function importKeyHex(hex, usage=['decrypt']){
-  return crypto.subtle.importKey('raw',fromHex(hex),{name:'AES-GCM'},false,usage)
+async function exportKeyHex(k){ return toB64Url(await crypto.subtle.exportKey('raw',k)) }
+async function importKeyHex(str, usage=['decrypt']){
+  return crypto.subtle.importKey('raw',fromB64Url(str),{name:'AES-GCM'},false,usage)
 }
 // Tolerant cleanup for manually-pasted keys: strips whitespace/newlines that
-// email clients often insert when wrapping long lines, and pulls the hex key
+// email clients often insert when wrapping long lines, and pulls the key
 // out if the user pasted a whole (possibly filter-mangled) URL instead of
 // just the fragment.
 function normalizeKeyInput(raw){
@@ -506,8 +525,7 @@ function normalizeKeyInput(raw){
   let s = String(raw).replace(/\s+/g,'')
   const hashIdx = s.indexOf('#')
   if(hashIdx !== -1) s = s.slice(hashIdx+1)
-  s = s.toLowerCase()
-  return /^[0-9a-f]{64}$/.test(s) ? s : null
+  return /^[A-Za-z0-9-~]{43}$/.test(s) ? s : null
 }
 async function deriveKey(password, saltHex){
   const enc = new TextEncoder()
@@ -865,9 +883,23 @@ async function boot(){
     }
   }catch{}
   applyTheme(_status)
+
   const m = location.pathname.match(/^\/note\/([A-Za-z0-9_-]+)\/?$/)
-  if(m) await pageNote(m[1])
-  else   await pageHome()
+  if(m){ await pageNote(m[1]); return }
+
+  // Fallback for links mangled by email/chat security software (e.g. a stray
+  // "\" injected next to a character, or extra punctuation). Rather than
+  // silently falling through to the home page, try to recover a usable ID
+  // by stripping anything that isn't alphanumeric, and let pageNote() show
+  // its normal "not found" message if it still doesn't resolve. This turns
+  // a confusing dead-end into an actionable error the recipient can act on.
+  const loose = location.pathname.match(/^\/note\/([^/]+)\/?$/)
+  if(loose){
+    const cleaned = loose[1].replace(/[^A-Za-z0-9]/g,'')
+    if(cleaned.length >= 8){ await pageNote(cleaned); return }
+  }
+
+  await pageHome()
 }
 
 function applyTheme(s){
